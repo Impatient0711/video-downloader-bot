@@ -1,26 +1,41 @@
-# ربات دانلود از لینک — ایمیج سبک
-# فقط دو ابزار دانلود نصب می‌شود: aria2c (لینک مستقیم) و yt-dlp (سایت‌ها) + ffmpeg برای ادغام/تبدیل
-FROM python:3.12-slim
+# ════════════════════════════════════════════════════════════════════════════
+#  ربات دانلود از لینک + سرور Bot API محلی (برای سقف ۲۰۰۰ مگابایت)
+#
+#  پایه: ایمیج رسمیِ سرور Bot API (Alpine 3.21 + باینری + کتابخانه‌هایش)
+#  رویش: پایتون، ffmpeg (ادغام/تبدیل بدون افت کیفیت)، aria2 (لینک مستقیم)
+#
+#  نتیجه: یک سرویس، یک مجموعه متغیر — سقف ارسال/دانلود ۲۰۰۰MB.
+#  اگر TELEGRAM_API_ID/TELEGRAM_API_HASH را نگذاری، ربات مثل قبل روی
+#  api.telegram.org کار می‌کند (سقف ۵۰MB) و بقیه‌چیز یکسان است.
+# ════════════════════════════════════════════════════════════════════════════
+FROM aiogram/telegram-bot-api:latest
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     TZ=Asia/Tehran \
-    DOWNLOAD_DIR=/tmp/downloads
+    TELEGRAM_HTTP_PORT=8081 \
+    TELEGRAM_WORK_DIR=/data \
+    TELEGRAM_TEMP_DIR=/data/tmp \
+    DOWNLOAD_DIR=/data/downloads
 
-RUN apt-get update -qq \
- && apt-get install -y --no-install-recommends \
-      aria2 ffmpeg ca-certificates tzdata \
- && rm -rf /var/lib/apt/lists/*
+RUN apk add --no-cache \
+        python3 \
+        py3-pip \
+        ffmpeg \
+        aria2 \
+        ca-certificates \
+        tzdata \
+ && ln -sf /usr/share/zoneinfo/Asia/Tehran /etc/localtime \
+ && mkdir -p /data /data/tmp /data/downloads
 
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN python3 -m pip install --no-cache-dir --break-system-packages -r requirements.txt
 
-COPY bot.py .
+COPY bot.py start.sh ./
+RUN chmod +x /app/start.sh
 
-# کاربر غیرروت برای امنیت
-RUN useradd -m -u 10001 bot && mkdir -p /tmp/downloads && chown -R bot:bot /tmp/downloads /app
-USER bot
-
-CMD ["python", "bot.py"]
+# ایمیج پایه entrypoint خودش را دارد (مخصوص اجرای فقط-سرور) — ما نقطهٔ ورود خودمان را داریم.
+ENTRYPOINT []
+CMD ["/bin/sh", "/app/start.sh"]
