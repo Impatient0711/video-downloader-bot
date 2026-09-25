@@ -17,7 +17,7 @@ PORT="${TELEGRAM_HTTP_PORT:-8081}"
 WORK="${TELEGRAM_WORK_DIR:-/data}"
 TEMP="${TELEGRAM_TEMP_DIR:-/data/tmp}"
 DL="${DOWNLOAD_DIR:-/data/downloads}"
-API_BIN="/usr/local/bin/telegram-bot-api"
+API_BIN="${TELEGRAM_API_BIN:-/usr/local/bin/telegram-bot-api}"
 API_PID=""
 BOT_PID=""
 
@@ -82,7 +82,7 @@ cleanup() {
 }
 trap cleanup INT TERM
 
-python3 /app/bot.py &
+python3 "${BOT_ENTRY:-/app/bot.py}" &
 BOT_PID=$!
 wait "$BOT_PID"
 CODE=$?
