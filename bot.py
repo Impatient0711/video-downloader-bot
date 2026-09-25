@@ -42,7 +42,7 @@ from typing import Optional
 import aiohttp
 
 START_TS = time.time()
-VERSION = "2.2"
+VERSION = "2.3"
 
 
 def _env(name: str, default: str = "") -> str:
@@ -879,6 +879,7 @@ class Bot:
         self.busy: dict[int, Job] = {}
         self.active: set[Job] = set()
         self.sessions: dict[str, dict] = {}
+        self.leech_wait: dict[int, float] = {}   # ‎/leech‎ زده و منتظر لینک است
 
     # ── دسترسی ──
     def allowed(self, uid: int) -> bool:
@@ -953,13 +954,13 @@ class Bot:
                 rep = msg.get("reply_to_message") or {}
                 rest = (rep.get("text") or rep.get("caption") or "").strip()
             if not rest:
+                self.leech_wait[uid] = time.time()
                 await self.tg.send(
                     chat_id,
-                    "🔗 *دستور لیچ*\n"
+                    "🔗 *لیچ* — لینک را همین حالا بفرست 👇\n"
                     "───────────────\n"
-                    "اینجوری بزن:  `/leech لینک`\n"
-                    "یا روی پیامی که لینک دارد ریپلای کن و `/leech` بفرست.\n\n"
-                    "فقط لینک هم بفرستی، همان کار را می‌کند. 🙂",
+                    "همین‌جوری هم می‌شود:  `/leech لینک`\n"
+                    "یا روی پیامی که لینک دارد ریپلای کن و `/leech` بزن.",
                     reply_to=mid)
                 return
             text = rest
@@ -976,7 +977,12 @@ class Bot:
                                         "صبر کن تمام شود یا /cancel بزن.", reply_to=mid)
             return
 
-        status = await self.tg.send(chat_id, "🔎 در حال بررسی لینک و کیفیت‌ها…", reply_to=mid)
+        waited = self.leech_wait.pop(uid, 0.0)
+        via_leech = bool(waited) and (time.time() - waited) < 120
+        status = await self.tg.send(
+            chat_id,
+            "🔗 لینکِ لیچ رسید — کیفیت‌ها را چک می‌کنم…" if via_leech
+            else "🔎 در حال بررسی لینک و کیفیت‌ها…", reply_to=mid)
         sid = secrets.token_hex(4)
         probe, err = await probe_url(url)
         smid = int((status or {}).get("message_id") or 0)
