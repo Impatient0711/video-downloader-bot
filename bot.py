@@ -42,7 +42,7 @@ from typing import Optional
 import aiohttp
 
 START_TS = time.time()
-VERSION = "2.0"
+VERSION = "2.1"
 
 
 def _env(name: str, default: str = "") -> str:
@@ -53,7 +53,12 @@ def _env(name: str, default: str = "") -> str:
 # ─────────────────────────── تنظیمات ───────────────────────────
 
 BOT_TOKEN = _env("BOT_TOKEN")
-API_BASE = _env("BOT_API_BASE", "https://api.telegram.org").rstrip("/")
+# اگر خودت BOT_API_BASE نگذاری ولی api_id/api_hash باشد، یعنی سرور محلی
+# (start.sh آن را بالا می‌آورد) → همان آدرس لوکال.
+_def_base = ("http://127.0.0.1:%s" % _env("TELEGRAM_HTTP_PORT", "8081")
+             if (_env("TELEGRAM_API_ID") and _env("TELEGRAM_API_HASH"))
+             else "https://api.telegram.org")
+API_BASE = _env("BOT_API_BASE", _def_base).rstrip("/")
 LOCAL_API = "api.telegram.org" not in API_BASE.lower()
 
 OWNER_ID = int(_env("OWNER_ID", "0") or 0)
@@ -206,7 +211,9 @@ def parse_progress_line(line: str, st: dict):
 async def run_proc(cmd: list[str], st: dict, watch_dir: Optional[Path] = None,
                    on_line=None) -> tuple[int, str]:
     """اجرای پروسه با خواندن خط‌به‌خط (برای نوار پیشرفت و لغو)."""
+    _log(st, "cmd", " ".join(str(c) for c in cmd))
     if not shutil.which(cmd[0]):
+        _log(st, "error", "برنامه نصب نیست: %s" % cmd[0])
         return 127, "not installed: %s" % cmd[0]
     proc = await asyncio.create_subprocess_exec(
         *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
@@ -255,8 +262,85 @@ async def run_proc(cmd: list[str], st: dict, watch_dir: Optional[Path] = None,
             await asyncio.wait_for(rt, timeout=10)
     code = await proc.wait()
     if oversize:
+        _log(st, "error", "حجم از سقف %dMB گذشت — پروسه کشته شد" % MAX_DOWNLOAD_MB)
         return 99, "MAX_FILESIZE"
+    _log(st, "exit", "کد خروج %d" % code)
+    if trailing:
+        _log(st, "output", "\n".join(trailing[-25:]))
     return code, "\n".join(trailing)
+
+
+# ─────────────────────────── لاگ ───────────────────────────
+#  هر دانلود یک لاگِ کامل دارد (دستورها + خروجی + خطاها).
+#  • با شروع هر دانلود، لاگِ قبلی پاک می‌شود.
+#  • دانلودِ موفق ⇒ لاگ دور ریخته می‌شود (خواستهٔ کاربر: بعد از هر دانلود پاک شود).
+#  • دانلودِ ناموفق ⇒ لاگ نگه داشته می‌شود تا با /log ببینی مشکل کجاست.
+
+MAX_LOG_LINES = int(_env("MAX_LOG_LINES", "400"))
+LOG_KEEP_ON_SUCCESS = _env("LOG_KEEP_ON_SUCCESS", "0") in ("1", "true", "yes", "on")
+LAST_LOG: dict = {"text": "", "ok": None, "url": "", "uid": 0, "at": 0.0, "stage": ""}
+
+
+class JobLog:
+    """لاگِ یک دانلود: هر مرحله با زمان و برچسب ثبت می‌شود."""
+
+    def __init__(self, uid: int, url: str):
+        self.uid, self.url = uid, url
+        self.t0 = time.time()
+        self.parts: list[str] = []
+
+    def add(self, tag: str, text: str = ""):
+        ts = time.strftime("%H:%M:%S", time.localtime())
+        body = str(text).replace("\r", "")
+        lines = body.split("\n")
+        if len(lines) > 60:
+            lines = lines[:30] + ["… (%d خط حذف شد) …" % (len(lines) - 60)] + lines[-30:]
+        head = "%s [%-10s] " % (ts, tag)
+        for i, ln in enumerate(lines):
+            self.parts.append((head if i == 0 else " " * len(head)) + ln)
+        if len(self.parts) > MAX_LOG_LINES:
+            self.parts = self.parts[: MAX_LOG_LINES // 2] + \
+                ["… (%d خط حذف شد) …" % (len(self.parts) - MAX_LOG_LINES)] + \
+                self.parts[-(MAX_LOG_LINES // 2):]
+
+    @property
+    def elapsed(self) -> str:
+        return hhmmss(time.time() - self.t0)
+
+    def dump(self, ok: bool, stage: str = "", extra: str = "") -> str:
+        head = [
+            "# لاگ ربات دانلود — نسخه %s" % VERSION,
+            "نتیجه: %s" % ("موفق ✅" if ok else "ناموفق ❌"),
+            "زمان اجرا: %s   |   مدت: %s" % (
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(self.t0)), self.elapsed),
+            "کاربر: %s" % self.uid,
+            "لینک: %s" % self.url,
+            "سرور API: %s (%s)" % (API_BASE, "محلی" if LOCAL_API else "ابر تلگرام"),
+            "سقف ارسال: %dMB   |   سقف دانلود: %dMB" % (MAX_UPLOAD_MB, MAX_DOWNLOAD_MB),
+            "مرحلهٔ خطا: %s" % (stage or "—"),
+        ]
+        if extra:
+            head.append("توضیح: %s" % extra)
+        head.append("-" * 64)
+        return "\n".join(head + self.parts) + "\n" + "-" * 64
+
+
+def _log(st: dict, tag: str, text: str = ""):
+    lg = (st or {}).get("log")
+    if lg:
+        lg.add(tag, text)
+
+
+def _set_last_log(lg: Optional[JobLog], ok: bool, stage: str = "", extra: str = ""):
+    """ذخیره/پاک‌کردنِ لاگ برای /log."""
+    global LAST_LOG
+    if ok and not LOG_KEEP_ON_SUCCESS:
+        LAST_LOG = {"text": "", "ok": True, "url": lg.url if lg else "", "uid": 0,
+                    "at": time.time(), "stage": ""}
+        return
+    LAST_LOG = {"text": lg.dump(ok, stage, extra) if lg else "(لاگی ثبت نشد)",
+                "ok": ok, "url": lg.url if lg else "", "uid": lg.uid if lg else 0,
+                "at": time.time(), "stage": stage}
 
 
 # ─────────────────────────── تلگرام ───────────────────────────
@@ -353,6 +437,7 @@ class Telegram:
             data["reply_to_message_id"] = reply_to
         if kb:
             data["reply_markup"] = kb
+        # (kb در پیام‌های خطا هم لازم است)
         try:
             return await self.call("sendMessage", data)
         except RuntimeError:
@@ -381,6 +466,19 @@ class Telegram:
     async def action(self, chat_id: int, what: str = "upload_video"):
         with contextlib.suppress(Exception):
             await self.call("sendChatAction", {"chat_id": chat_id, "action": what})
+
+    async def send_doc(self, chat_id: int, name: str, data: bytes, caption: str = "",
+                       reply_to: int = 0):
+        """ارسال یک فایل کوچک از حافظه (برای لاگ)."""
+        form = aiohttp.FormData()
+        form.add_field("chat_id", str(chat_id))
+        if reply_to:
+            form.add_field("reply_to_message_id", str(reply_to))
+        if caption:
+            form.add_field("caption", caption[:1024])
+        form.add_field("document", io.BytesIO(data), filename=name,
+                       content_type="text/plain; charset=utf-8")
+        return await self.call("sendDocument", form=form, timeout=300)
 
     async def send_media(self, chat_id: int, path: Path, kind: str, caption: str,
                          reply_to: int = 0, meta: Optional[dict] = None):
@@ -770,6 +868,8 @@ class Job:
         self.task: Optional[asyncio.Task] = None
         self.st: dict = {"pct": 0.0, "done": 0.0, "total": 0.0, "speed": "", "eta": "",
                          "stage": "download", "note": ""}
+        self.log: Optional[JobLog] = None
+        self.st["log"] = None
 
 
 class Bot:
@@ -829,6 +929,9 @@ class Bot:
         if low.startswith("/status"):
             await self.tg.send(chat_id, await self.status_text(), reply_to=mid)
             return
+        if low.startswith("/log"):
+            await self.send_log(chat_id, uid, mid)
+            return
         if low.startswith("/cancel"):
             job = self.busy.get(uid)
             if job:
@@ -878,6 +981,10 @@ class Bot:
         chat_id = int((msg.get("chat") or {}).get("id") or 0)
         mid = int(msg.get("message_id") or 0)
         uid = int((cb.get("from") or {}).get("id") or 0)
+        if data == "log:last":
+            await self.tg.answer_cb(cid, "می‌فرستم…")
+            await self.send_log(chat_id, uid, 0)
+            return
         if not data.startswith("q:") or not chat_id:
             await self.tg.answer_cb(cid)
             return
@@ -924,7 +1031,7 @@ class Bot:
             "• هر لینکی: صفحهٔ سایت، لینک مستقیم، `.mp4`، `.ts`، `m3u8` و…\n"
             "• فایل غیر mp4 خودکار (بدون افت کیفیت) به mp4 تبدیل می‌شود تا ویدیو بماند\n"
             "• سقف ارسال فعلی: *%s*\n"
-            "• /status وضعیت · /cancel لغو · /id آیدی تو" % cap
+            "• /status وضعیت · /cancel لغو · /log لاگِ آخرین خطا · /id آیدی تو" % cap
         ) + extra
 
     async def status_text(self) -> str:
@@ -936,15 +1043,49 @@ class Bot:
                  "• سقف ارسال: %s" % cap,
                  "• در جریان: %d (هم‌زمان: %d)" % (len(self.active), MAX_CONCURRENT),
                  "• پوشهٔ موقت: %.1fMB" % tree_size_mb(DOWNLOAD_DIR),
-                 "• نسخه: %s · زمان اجرا: %s" % (VERSION, hhmmss(time.time() - START_TS))]
+                 "• نسخه: %s · زمان اجرا: %s" % (VERSION, hhmmss(time.time() - START_TS)),
+                 "• لاگِ خطا: %s" % ("ذخیره شده (با /log بفرست)" if (LAST_LOG.get("text") or "").strip()
+                                     else "خالی — بعد از هر دانلود موفق پاک می‌شود")]
         for j in list(self.active):
             lines.append("  – %s" % cut(j.st.get("title") or "?", 50))
         return "\n".join(lines)
+
+    async def send_log(self, chat_id: int, uid: int, reply_to: int):
+        """لاگ آخرین دانلود را می‌فرستد (کوتاه ⇒ متن، بلند ⇒ فایل txt)."""
+        text = (LAST_LOG.get("text") or "").strip()
+        if not text:
+            await self.tg.send(chat_id,
+                              "📄 لاگی برای فرستادن نیست.\n"
+                              "(بعد از هر دانلودِ **موفق** لاگ پاک می‌شود؛ اگر لینکی "
+                              "فایل نداد، خودش لاگ نگه می‌دارد و همین‌جا می‌فرستم.)",
+                              reply_to=reply_to)
+            return
+        if uid not in (OWNER_ID, LAST_LOG.get("uid")) and not self.allowed(uid):
+            await self.tg.send(chat_id, "⛔️ دسترسی نداری.", reply_to=reply_to)
+            return
+        head = ("📄 لاگ %s\nلینک: %s\nزمان: %s" % (
+            "آخرین دانلود ناموفق" if LAST_LOG.get("ok") is False else "آخرین دانلود",
+            cut(LAST_LOG.get("url") or "—", 70),
+            time.strftime("%H:%M:%S", time.localtime(LAST_LOG.get("at") or time.time()))))
+        if len(text) <= 3500:
+            await self.tg.send(chat_id, head + "\n\n`" + text.replace("`", "'") + "`",
+                              reply_to=reply_to)
+        else:
+            data = text.encode("utf-8", "replace")
+            name = "log-%s.txt" % time.strftime("%m%d-%H%M%S")
+            await self.tg.send_doc(chat_id, name, data, head, reply_to)
 
     # ── بدنهٔ کار ──
     async def _work(self, job: Job, probe: Probe, option: Option):
         st = job.st
         st["title"] = probe.title or option.label
+        # لاگِ قبلی پاک می‌شود؛ از این لحظه فقط لاگِ همین دانلود ثبت می‌گردد
+        st["log"] = JobLog(job.uid, probe.url)
+        lg = st["log"]
+        lg.add("start", "کیفیت انتخابی: %s | تخمین: %s" % (option.label, human(option.est)))
+        lg.add("probe", "عنوان: %s | مدت: %s | گزینه‌ها: %s" % (
+            cut(probe.title, 80) or "—", hhmmss(probe.duration) if probe.duration else "—",
+            "، ".join("%s(%s)" % (o.label, human(o.est)) for o in probe.options)))
 
         async def ticker():
             while True:
@@ -983,11 +1124,16 @@ class Bot:
                         st["note"] = "yt-dlp نشد — با aria2c تلاش می‌کنم"
                         path, err = await download_aria2(probe.url, folder, st)
                 if job.cancelled:
+                    lg.add("cancel", "کاربر دانلود را لغو کرد")
+                    _set_last_log(lg, False, "لغو توسط کاربر")
                     return
                 if not path:
+                    lg.add("download", "ناموفق — کد خطا: %s" % err)
+                    _set_last_log(lg, False, "دانلود", err)
                     await self._error(job, err)
                     return
                 size = path.stat().st_size
+                lg.add("download", "موفق: %s (%s) در %s" % (path.name, human(size), lg.elapsed))
                 if size > MAX_DOWNLOAD_MB * 1048576:
                     await self._say(job, "❌ فایل %s شد — بیشتر از سقف %dMB."
                                     % (human(size), MAX_DOWNLOAD_MB))
@@ -1003,7 +1149,12 @@ class Bot:
                     await self.tg.edit(job.chat_id, job.msg_id,
                                        progress_text("remux", 1, size, size))
                 path, why, meta = await to_sendable_video(path, folder, st)
+                lg.add("remux", "خروجی: %s | وضعیت: %s | ابعاد: %sx%s | مدت: %ss" % (
+                    path.name, why or "بدون تبدیل", meta.get("width"), meta.get("height"),
+                    meta.get("duration")))
                 if job.cancelled:
+                    lg.add("cancel", "لغو بعد از تبدیل")
+                    _set_last_log(lg, False, "لغو توسط کاربر")
                     return
                 size = path.stat().st_size
                 kind = "video" if (path.suffix.lower() in VIDEO_EXT and why != "codec") else \
@@ -1012,8 +1163,9 @@ class Bot:
                 # ── سقف ارسال ──
                 cap = MAX_UPLOAD_MB * 1048576
                 if size > cap:
-                    if option.est and not option.audio and False:
-                        pass
+                    lg.add("upload", "متوقف: حجم %s از سقف %dMB بیشتر است" % (human(size), MAX_UPLOAD_MB))
+                    _set_last_log(lg, False, "سقف ارسال",
+                                  "حجم %s > سقف %dMB" % (human(size), MAX_UPLOAD_MB))
                     await self._say(job,
                                     "📦 فایل %s شد و سقف ارسال فعلی *%s* است.\n"
                                     "• کیفیت پایین‌تر انتخاب کن\n"
@@ -1086,6 +1238,10 @@ class Bot:
                         await utick
                     with contextlib.suppress(Exception):
                         stream.close()
+                lg.add("upload", "موفق: %s به‌شکل %s در %s" % (
+                    human(size), kind, hhmmss(time.time() - holder["t0"])))
+                lg.add("done", "کل زمان: %s" % lg.elapsed)
+                _set_last_log(lg, True)          # ✅ موفق ⇒ لاگ پاک می‌شود
                 if job.msg_id:
                     await self.tg.edit(job.chat_id, job.msg_id,
                                        "✅ ارسال شد  ·  %s  ·  %s" % (human(size),
@@ -1096,11 +1252,16 @@ class Bot:
             raise
         except Exception as e:
             msg = str(e)
+            lg = st.get("log")
+            if lg:
+                lg.add("error", msg[:500])
             if "too big" in msg.lower() or "413" in msg or "file is too large" in msg.lower():
+                _set_last_log(lg, False, "آپلود", "تلگرام فایل را بزرگ‌تر از حد مجاز دانست")
                 await self._say(job, "❌ تلگرام فایل را بزرگ‌تر از حد مجاز دانست.\n"
                                      "کیفیت پایین‌تر را انتخاب کن یا سرور Bot API محلی را وصل کن.")
             else:
-                await self._say(job, "❌ خطا: %s" % cut(msg, 300))
+                _set_last_log(lg, False, "خطای غیرمنتظره", msg[:200])
+                await self._say(job, "❌ خطا: %s\n\n📄 برای جزئیات /log را بزن." % cut(msg, 250))
         finally:
             tick.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -1126,7 +1287,13 @@ class Bot:
             "missing": "❌ فایل روی سرور پیدا نشد (لینک منقضی شده؟).",
             "failed": "❌ دانلود نشد. لینک را چک کن یا کمی بعد دوباره بفرست.",
         }
-        await self._say(job, table.get(err, "❌ دانلود نشد: %s" % cut(err, 200)))
+        base = table.get(err, "❌ دانلود نشد: %s" % cut(err, 200))
+        text = base + "\n\n📄 برای دیدن مشکل، /log را بزن:"
+        kb = {"inline_keyboard": [[{"text": "📄 لاگ", "callback_data": "log:last"}]]}
+        if job.msg_id:
+            await self.tg.edit(job.chat_id, job.msg_id, text, kb=kb)
+        else:
+            await self.tg.send(job.chat_id, text, reply_to=job.reply_to)
 
 
 # ─────────────────────────── نگهبان دیسک ───────────────────────────
