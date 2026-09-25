@@ -42,7 +42,7 @@ from typing import Optional
 import aiohttp
 
 START_TS = time.time()
-VERSION = "2.1"
+VERSION = "2.2"
 
 
 def _env(name: str, default: str = "") -> str:
@@ -945,6 +945,25 @@ class Bot:
                 await self.tg.send(chat_id, "چیزی برای لغو نبود.", reply_to=mid)
             return
 
+        # ── دستور لیچ: ‎/leech لینک‎ — یا ریپلای روی پیامی که لینک دارد ──
+        if low.startswith("/leech"):
+            parts = text.split(None, 1)
+            rest = parts[1].strip() if len(parts) > 1 else ""
+            if not rest:
+                rep = msg.get("reply_to_message") or {}
+                rest = (rep.get("text") or rep.get("caption") or "").strip()
+            if not rest:
+                await self.tg.send(
+                    chat_id,
+                    "🔗 *دستور لیچ*\n"
+                    "───────────────\n"
+                    "اینجوری بزن:  `/leech لینک`\n"
+                    "یا روی پیامی که لینک دارد ریپلای کن و `/leech` بفرست.\n\n"
+                    "فقط لینک هم بفرستی، همان کار را می‌کند. 🙂",
+                    reply_to=mid)
+                return
+            text = rest
+
         found = URL_RE.search(text)
         if not found:
             await self.tg.send(chat_id, "یک لینک بفرست تا کیفیت‌های موجودش را نشانت بدهم. "
@@ -1030,6 +1049,7 @@ class Bot:
             "کپشن و لینک اصلی تحویل داده می‌شود.\n\n"
             "• هر لینکی: صفحهٔ سایت، لینک مستقیم، `.mp4`، `.ts`، `m3u8` و…\n"
             "• فایل غیر mp4 خودکار (بدون افت کیفیت) به mp4 تبدیل می‌شود تا ویدیو بماند\n"
+            "• /leech لینک — همان دانلود، ولی با دستور (مثل ربات‌های لیچ)\n"
             "• سقف ارسال فعلی: *%s*\n"
             "• /status وضعیت · /cancel لغو · /log لاگِ آخرین خطا · /id آیدی تو" % cap
         ) + extra
@@ -1342,6 +1362,16 @@ async def main() -> int:
     if not ALLOWED_USERS and not OWNER_ID:
         print("   ⚠️ بدون لیست دسترسی — ربات برای همه باز است.", flush=True)
 
+    with contextlib.suppress(Exception):
+        await tg.call("setMyCommands", {"commands": [
+            {"command": "leech", "description": "دانلود فیلم از لینک (لیچ)"},
+            {"command": "start", "description": "راهنما و شروع"},
+            {"command": "status", "description": "وضعیت ربات و سقف ارسال"},
+            {"command": "log", "description": "لاگ آخرین خطا"},
+            {"command": "cancel", "description": "لغو دانلود در جریان"},
+            {"command": "id", "description": "آیدی عددی من"},
+        ]})
+        print("   منوی دستورها ثبت شد (leech/start/status/log/cancel/id)", flush=True)
     bot = Bot(tg)
     tasks = [asyncio.create_task(bot.run()), asyncio.create_task(sweeper())]
     stop = asyncio.Event()
