@@ -42,7 +42,7 @@ from typing import Optional
 import aiohttp
 
 START_TS = time.time()
-VERSION = "2.4"
+VERSION = "2.5"
 
 
 def _env(name: str, default: str = "") -> str:
@@ -128,6 +128,39 @@ def disk_free_gb(p: Path) -> tuple[float, float]:
         return u.free / 1073741824.0, u.total / 1073741824.0
     except Exception:
         return (-1.0, -1.0)
+
+
+def disk_selftest(mb: int) -> None:
+    """نوشتنِ واقعیِ یک فایل با حجم دلخواه — برای فهمیدن سقفِ واقعیِ فضای دیسک.
+
+    با متغیر محیطی DISK_SELFTEST_MB فعال می‌شود (مثلاً 2400) و هر بار راه‌اندازی
+    نتیجه را در لاگ می‌نویسد و فایل آزمایشی را پاک می‌کند.
+    """
+    p = DOWNLOAD_DIR / ".disk_test.bin"
+    chunk = b"\0" * (4 * 1024 * 1024)
+    total = mb * 1048576
+    written = 0
+    t0 = time.time()
+    free0, tot0 = disk_free_gb(DOWNLOAD_DIR)
+    print("[selftest] شروع تست دیسک: هدف %dMB (فضای گزارش‌شده: %.2fGB از %.1fGB)"
+          % (mb, free0, tot0), flush=True)
+    try:
+        with open(p, "wb") as f:
+            while written < total:
+                n = min(len(chunk), total - written)
+                f.write(chunk[:n])
+                f.flush()
+                written += n
+                if written % (512 * 1048576) == 0:
+                    print("[selftest] تا %dMB بدون خطا…" % (written // 1048576), flush=True)
+        print("[selftest] ✅ %dMB با موفقیت نوشته شد (%.1f ثانیه) ⇒ جا برای فایل‌های بزرگ هست"
+              % (written // 1048576, time.time() - t0), flush=True)
+    except OSError as e:
+        print("[selftest] ❌ نوشتن در %dMB شکست خورد: %s ⇒ سقف واقعی همین حدود است"
+              % (written // 1048576, e), flush=True)
+    finally:
+        with contextlib.suppress(Exception):
+            p.unlink()
 
 
 def tree_size_mb(p: Path) -> float:
@@ -1379,6 +1412,10 @@ async def main() -> int:
     print("   پوشه: %s · سقف دانلود: %dMB · هم‌زمان: %d · تبدیل به mp4: %s"
           % (DOWNLOAD_DIR, MAX_DOWNLOAD_MB, MAX_CONCURRENT, "روشن" if FORCE_MP4 else "خاموش"),
           flush=True)
+    _selftest = int(float(_env("DISK_SELFTEST_MB", "0") or 0))
+    if _selftest > 0:
+        DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(disk_selftest, _selftest)
     if not LOCAL_API:
         print("   ℹ️ برای ارسال تا ۲GB، سرور Bot API محلی را وصل کن (README → بخش ۲GB).", flush=True)
     if 0 <= dfree < (MAX_UPLOAD_MB / 1024.0) * 2.2:
