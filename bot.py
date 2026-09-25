@@ -42,7 +42,7 @@ from typing import Optional
 import aiohttp
 
 START_TS = time.time()
-VERSION = "2.3"
+VERSION = "2.4"
 
 
 def _env(name: str, default: str = "") -> str:
@@ -119,6 +119,15 @@ def hhmmss(sec: float) -> str:
 def cut(s: str, n: int) -> str:
     s = (s or "").strip().replace("\n", " ")
     return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def disk_free_gb(p: Path) -> tuple[float, float]:
+    """(فضای آزاد، کل) به گیگابایت برای مسیری که فایل‌ها در آن ساخته می‌شوند."""
+    try:
+        u = shutil.disk_usage(str(p if p.exists() else p.parent))
+        return u.free / 1073741824.0, u.total / 1073741824.0
+    except Exception:
+        return (-1.0, -1.0)
 
 
 def tree_size_mb(p: Path) -> float:
@@ -1063,12 +1072,16 @@ class Bot:
     async def status_text(self) -> str:
         cap = "%dMB" % MAX_UPLOAD_MB if MAX_UPLOAD_MB < 1024 else "%dMB (≈%.2fGB)" % (
             MAX_UPLOAD_MB, MAX_UPLOAD_MB / 1024)
+        free_gb, tot_gb = disk_free_gb(DOWNLOAD_DIR)
         lines = ["📊 *وضعیت*",
                  "───────────────",
                  "• سرور API: %s" % ("محلی" if LOCAL_API else "ابر تلگرام"),
                  "• سقف ارسال: %s" % cap,
                  "• در جریان: %d (هم‌زمان: %d)" % (len(self.active), MAX_CONCURRENT),
                  "• پوشهٔ موقت: %.1fMB" % tree_size_mb(DOWNLOAD_DIR),
+                 "• فضای آزاد دیسک: %s از %s" % (
+                     ("%.2fGB" % free_gb) if free_gb >= 0 else "?",
+                     ("%.1fGB" % tot_gb) if tot_gb >= 0 else "?"),
                  "• نسخه: %s · زمان اجرا: %s" % (VERSION, hhmmss(time.time() - START_TS)),
                  "• لاگِ خطا: %s" % ("ذخیره شده (با /log بفرست)" if (LAST_LOG.get("text") or "").strip()
                                      else "خالی — بعد از هر دانلود موفق پاک می‌شود")]
@@ -1360,11 +1373,16 @@ async def main() -> int:
     cap_txt = ("%dMB" % MAX_UPLOAD_MB) if MAX_UPLOAD_MB < 1024 else ("%dMB ≈ %.2fGB" % (
         MAX_UPLOAD_MB, MAX_UPLOAD_MB / 1024))
     print("   سرور API: %s → سقف ارسال %s" % (API_BASE, cap_txt), flush=True)
+    dfree, dtot = disk_free_gb(DOWNLOAD_DIR)
+    if dfree >= 0:
+        print("   فضای آزاد دیسک: %.2fGB از %.1fGB" % (dfree, dtot), flush=True)
     print("   پوشه: %s · سقف دانلود: %dMB · هم‌زمان: %d · تبدیل به mp4: %s"
           % (DOWNLOAD_DIR, MAX_DOWNLOAD_MB, MAX_CONCURRENT, "روشن" if FORCE_MP4 else "خاموش"),
           flush=True)
     if not LOCAL_API:
         print("   ℹ️ برای ارسال تا ۲GB، سرور Bot API محلی را وصل کن (README → بخش ۲GB).", flush=True)
+    if 0 <= dfree < (MAX_UPLOAD_MB / 1024.0) * 2.2:
+        print("   ⚠️ فضای دیسک برای فایل‌های بزرگ کم است — یک Volume روی /data بگذار.", flush=True)
     if not ALLOWED_USERS and not OWNER_ID:
         print("   ⚠️ بدون لیست دسترسی — ربات برای همه باز است.", flush=True)
 
