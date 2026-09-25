@@ -42,7 +42,7 @@ from typing import Optional
 import aiohttp
 
 START_TS = time.time()
-VERSION = "2.5"
+VERSION = "2.6"
 
 
 def _env(name: str, default: str = "") -> str:
@@ -90,7 +90,7 @@ FILE_EXT = {".zip", ".rar", ".7z", ".pdf", ".apk"}
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
-URL_RE = re.compile(r"https?://[^\s<>\"']+", re.I)
+URL_RE = re.compile(r"(?:https?://|www\.)[^\s<>\"']+", re.I)
 # کدک‌هایی که تلگرام داخل mp4 به‌شکل ویدیو نشان می‌دهد
 OK_VCODEC = {"h264", "hevc", "h265", "mpeg4", "vp9", "av1"}
 OK_ACODEC = {"aac", "mp3", "ac3", "eac3", "opus", "vorbis", "none", ""}
@@ -1013,6 +1013,11 @@ class Bot:
                                         "راهنما: /help", reply_to=mid)
             return
         url = found.group(0).rstrip(").,»\"'")
+        if not url.lower().startswith("http"):
+            url = "https://" + url
+        all_links = URL_RE.findall(text)
+        more_links = ("ℹ️ %d لینک دیدم — اولی را پردازش می‌کنم؛ بقیه را جداگانه بفرست.\n\n"
+                      % len(all_links)) if len(all_links) > 1 else ""
 
         if uid in self.busy:
             await self.tg.send(chat_id, "⏳ همین حالا یک دانلود برایت در جریان است. "
@@ -1038,7 +1043,8 @@ class Bot:
         self.sessions[sid] = {"probe": probe, "uid": uid, "at": time.time(),
                               "chat_id": chat_id, "mid": smid, "reply_to": mid}
         self._gc_sessions()
-        await self.tg.edit(chat_id, smid, menu_text(probe), kb=menu_keyboard(sid, probe))
+        await self.tg.edit(chat_id, smid, more_links + menu_text(probe),
+                           kb=menu_keyboard(sid, probe))
 
     # ── انتخاب کیفیت (دکمه) ──
     async def on_callback(self, cb: dict):
