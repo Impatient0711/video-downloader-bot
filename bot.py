@@ -43,7 +43,7 @@ from typing import Optional
 import aiohttp
 
 START_TS = time.time()
-VERSION = "2.13"
+VERSION = "2.14"
 
 
 def _env(name: str, default: str = "") -> str:
@@ -1125,6 +1125,40 @@ def codecs_of(probe: dict) -> tuple[str, str, int, int, int]:
     return v, a, w, h, dur
 
 
+async def video_meta_of(path: Path) -> dict:
+    """ابعاد و مدتِ **فایلِ نهایی** — درست قبل از ارسال خوانده می‌شود.
+
+    چرا: اگر width/height/duration را به تلگرام ندهیم (یا غلط بدهیم)،
+    مدت 00:00 می‌ماند و کادرِ فایل در چت بی‌قواره می‌شود. ربات‌های حرفه‌ای
+    هم همین کار را می‌کنند: ffprobe روی فایلِ آمادهٔ ارسال.
+    """
+    meta: dict = {}
+    pr = await ffprobe_codecs(path)
+    _v, _a, w, h, dur = codecs_of(pr)
+    # چرخش (ویدیوهای عمودیِ موبایل): ابعادِ نمایش داده‌شده را بده
+    with contextlib.suppress(Exception):
+        for st_ in (pr.get("streams") or []):
+            if st_.get("codec_type") != "video":
+                continue
+            rot = 0
+            for sd in (st_.get("side_data_list") or []):
+                with contextlib.suppress(Exception):
+                    rot = int(float(sd.get("rotation") or 0))
+            if abs(rot) % 180 == 90 and w and h:
+                w, h = h, w
+            break
+    if not dur:
+        with contextlib.suppress(Exception):
+            dur = int(float((pr.get("format") or {}).get("duration") or 0))
+    if w:
+        meta["width"] = int(w)
+    if h:
+        meta["height"] = int(h)
+    if dur:
+        meta["duration"] = int(dur)
+    return meta
+
+
 async def to_sendable_video(path: Path, folder: Path, st: dict) -> tuple[Path, str, dict]:
     """اگر لازم باشد، فایل را بدون افت کیفیت به mp4 تبدیل می‌کند تا ویدیو بماند."""
     meta: dict = {}
@@ -1760,6 +1794,7 @@ class Bot:
 
                 # ── انتخاب تامبنیل از داخل فیلم ──
                 thumb_path: Optional[Path] = None
+                thumb_skipped = False
                 if kind == "video" and THUMB_CHOICE:
                     vdur = float(meta.get("duration") or 0)
                     if job.msg_id:
@@ -1790,9 +1825,38 @@ class Bot:
                             else:
                                 lg.add("thumb", "ساخت تامبنیل ناموفق بود")
                         else:
+                            thumb_skipped = True
                             lg.add("thumb", "بدون تامبنیل (به‌خواست کاربر)")
                     else:
                         lg.add("thumb", "عکسی گرفته نشد (ffmpeg؟)")
+
+                # ── متادیتای فایلِ نهایی، دقیقاً قبل از ارسال (مدت/ابعاد) ──
+                fresh = await video_meta_of(path)
+                for k, v in fresh.items():
+                    if v:
+                        meta[k] = v
+                lg.add("meta", "فایل نهایی: %sx%s · %ss" % (
+                    meta.get("width"), meta.get("height"), meta.get("duration")))
+                if not (meta.get("width") and meta.get("height")):
+                    lg.add("meta", "⚠️ ابعاد فایل خوانده نشد — کادرِ چت ممکن است ناقواره شود")
+                if not meta.get("duration"):
+                    lg.add("meta", "⚠️ مدت فایل خوانده نشد — ممکن است 00:00 بماند")
+
+                # تامبنیل باید همیشه باشد (وگرنه تلگرام کادرِ سیاه نشان می‌دهد)
+                if kind == "video" and not thumb_skipped and not thumb_path:
+                    vdur = float(meta.get("duration") or 0)
+                    lg.add("thumb", "تامبنیل نبود ⇒ از وسط فیلم می‌سازم (%.1fs)" % (vdur / 2))
+                    spare = await extract_frames(path, folder, vdur, st, 1)
+                    if spare:
+                        thumb_path = await make_thumb(
+                            spare[0], folder, st,
+                            int(meta.get("width") or 0), int(meta.get("height") or 0))
+                        lg.add("thumb", "تامبنیلِ جایگزین: %s" % (
+                            human(thumb_path.stat().st_size) if thumb_path else "ناموفق"))
+                # اگر عکسی که کاربر انتخاب کرده بود سالم نبود، همان‌جا بساز
+                if kind == "video" and thumb_path and not thumb_path.exists():
+                    lg.add("thumb", "فایل تامبنیل نبود ⇒ دوباره می‌سازم")
+                    thumb_path = None
 
                 # ── آپلود با نوار مربعی ──
                 st.update({"stage": "upload", "pct": 0, "done": 0, "total": size,
@@ -1843,8 +1907,10 @@ class Bot:
                 if kind == "video":
                     form.add_field("supports_streaming", "true")
                     for k in ("duration", "width", "height"):
-                        if meta.get(k):
-                            form.add_field(k, str(int(meta[k])))
+                        with contextlib.suppress(Exception):
+                            val = int(meta.get(k) or 0)
+                            if val > 0:
+                                form.add_field(k, str(val))
                 thumb_fh = None
                 if thumb_path and thumb_path.exists():
                     thumb_fh = open(thumb_path, "rb")
