@@ -43,7 +43,7 @@ from typing import Optional
 import aiohttp
 
 START_TS = time.time()
-VERSION = "2.14"
+VERSION = "2.15"
 
 
 def _env(name: str, default: str = "") -> str:
@@ -83,7 +83,13 @@ AUTO_FALLBACK = _env("AUTO_FALLBACK", "1") not in ("0", "false", "no", "off")
 KEEP_FILES = _env("KEEP_FILES", "0") in ("1", "true", "yes", "on")
 COOKIES_FILE = _env("COOKIES_FILE")
 FORCE_MP4 = _env("FORCE_MP4", "1") not in ("0", "false", "no", "off")   # ارسال به‌شکل ویدیو
-REENCODE = _env("REENCODE", "0") in ("1", "true", "yes", "on")         # تبدیل کدک (کند)
+# تبدیل کدک: پیش‌فرض روشن — تلگرام فقط برای H.264 کادر/تامبنیل/زمان می‌سازد
+REENCODE = _env("REENCODE", "1") not in ("0", "false", "no", "off")
+# کادرِ ویدیو در چت مربع شود (خواستهٔ کاربر): عکس ۱:۱ + ابعادِ اعلامی ۱:۱
+VIDEO_SQUARE = _env("VIDEO_SQUARE", "1") not in ("0", "false", "no", "off")
+SQUARE_SIDE = max(320, int(_env("SQUARE_SIDE", "720") or 720))
+# اگر تلگرام تامبنیل/مدت را ذخیره نکرد ⇒ یک بار دیگر با عکسِ تازه بفرست
+REPAIR_SEND = _env("REPAIR_SEND", "1") not in ("0", "false", "no", "off")
 SESSION_TTL = int(_env("MENU_TTL_S", "900"))
 MAX_OPTIONS = int(_env("MAX_OPTIONS", "6"))
 
@@ -95,9 +101,10 @@ FILE_EXT = {".zip", ".rar", ".7z", ".pdf", ".apk"}
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 URL_RE = re.compile(r"(?:https?://|www\.)[^\s<>\"']+", re.I)
-# کدک‌هایی که تلگرام داخل mp4 به‌شکل ویدیو نشان می‌دهد
-OK_VCODEC = {"h264", "hevc", "h265", "mpeg4", "vp9", "av1"}
-OK_ACODEC = {"aac", "mp3", "ac3", "eac3", "opus", "vorbis", "none", ""}
+# فقط H.264: تنها کدکی که تلگرام برایش کادر/تامبنیل/زمان می‌سازد (بقیه ⇒ تبدیل)
+OK_VCODEC = {"h264"}
+# صدا: AAC (و mp3) — بقیه به AAC تبدیل می‌شود
+OK_ACODEC = {"aac", "mp3"}
 
 
 # ─────────────────────────── کمکی‌ها ───────────────────────────
@@ -396,10 +403,24 @@ class ProgressFile(io.RawIOBase):
     """فایل با شمارش بایت‌های خوانده‌شده — برای نوار پیشرفتِ آپلود."""
 
     def __init__(self, path: Path, on_read):
+        self._path = path
         self._f = open(path, "rb")
         self._size = path.stat().st_size
         self._n = 0
         self._cb = on_read
+
+    def reopen(self):
+        """از نو باز کن — aiohttp بعد از هر ارسال، فایلِ زیربنایی را می‌بندد.
+
+        (بدون این، ارسالِ دومِ همان فایل — مثل ترمیم یا ساده‌فرستادنِ کپشن —
+        با خطای «I/O operation on closed file» شکست می‌خورد.)
+        """
+        with contextlib.suppress(Exception):
+            self._f.close()
+        self._f = open(self._path, "rb")
+        self._n = 0
+        with contextlib.suppress(Exception):
+            self._cb(0, self._size)
 
     @property
     def n(self) -> int:
@@ -1160,49 +1181,63 @@ async def video_meta_of(path: Path) -> dict:
 
 
 async def to_sendable_video(path: Path, folder: Path, st: dict) -> tuple[Path, str, dict]:
-    """اگر لازم باشد، فایل را بدون افت کیفیت به mp4 تبدیل می‌کند تا ویدیو بماند."""
+    """فایلِ ارسالی را «ویدیوی قابلِ‌نمایش» می‌کند: mp4 با H.264 و AAC.
+
+    چرا: تلگرام برای ویدیوهای بزرگ خودش کادر/تامبنیل/زمان نمی‌سازد و فایلِ
+    کدک‌های دیگر (HEVC/AV1/VP9/…) هم بی‌پیش‌نمایش می‌ماند؛ پس همین‌جا کدک را
+    استاندارد می‌کنیم تا کادرِ چت، تامبنیل و زمانِ فیلم درست در بیاید.
+    """
     meta: dict = {}
     if not FORCE_MP4:
-        return path, "", meta
-    if path.suffix.lower() in (".mp4", ".m4v"):
-        pr = await ffprobe_codecs(path)
-        v, a, w, h, dur = codecs_of(pr)
-        meta = {"width": w, "height": h, "duration": dur}
-        return path, "", meta
+        return path, "off", meta
     if path.suffix.lower() not in VIDEO_EXT:
         return path, "", meta                      # فایل عادی (zip/pdf/…) — داکیومنت
-    if not shutil.which("ffmpeg"):
+    if not (shutil.which("ffmpeg") and shutil.which("ffprobe")):
         return path, "no-ffmpeg", meta
 
-    st["note"] = "🎞 تبدیل به mp4 (بدون افت کیفیت)…"
     pr = await ffprobe_codecs(path)
     v, a, w, h, dur = codecs_of(pr)
     meta = {"width": w, "height": h, "duration": dur}
-    if v and (v not in OK_VCODEC or (a and a not in OK_ACODEC)):
-        # کدک ناسازگار: یا با کپی نمی‌شود، یا تلگرام ویدیو نمی‌بیند
-        if not REENCODE:
-            return path, "codec", meta
+    is_mp4 = path.suffix.lower() in (".mp4", ".m4v")
+    v_ok = (not v) or v in OK_VCODEC          # کدک خوانده نشد ⇒ دست به فایل نزن
+    a_ok = (not a) or a in OK_ACODEC
+    if is_mp4 and v_ok and a_ok:
+        return path, "", meta                  # همین فایل آمادهٔ ارسال است
+    if not v_ok and not REENCODE:
+        return path, "codec", meta             # تبدیل کدک را خاموش کرده‌ای
+
+    st["note"] = ("🎞 تبدیل کدک به H.264 (کیفیت حفظ می‌شود)…" if not v_ok
+                  else "🎞 آمادهٔ ارسال می‌کنم…")
     out_path = folder / (path.stem + "_v.mp4")
-    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(path)]
-    if REENCODE and v and v not in OK_VCODEC:
-        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac"]
-    else:
-        cmd += ["-c", "copy"]
-    cmd += ["-movflags", "+faststart", "-bsf:a", "aac_adtstoasc", str(out_path)]
-    code, out = await run_proc(cmd, st)
-    if code == 0 and out_path.exists() and out_path.stat().st_size > 0:
+    base = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(path),
+            "-map", "0:v:0", "-map", "0:a?", "-sn", "-dn"]
+    vargs = (["-c:v", "copy"] if v_ok else
+             ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p"])
+    aargs = ["-c:a", "copy"] if a_ok else ["-c:a", "aac", "-b:a", "128k"]
+    tail = ["-movflags", "+faststart", str(out_path)]
+    tries = []
+    if a == "aac" and not is_mp4:
+        tries.append(base + vargs + aargs + ["-bsf:a", "aac_adtstoasc"] + tail)
+    tries.append(base + vargs + aargs + tail)
+    if not v_ok or not a_ok:                   # آخرین تلاش: تبدیل کامل
+        tries.append(base + ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                             "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "128k"] + tail)
+    for cmd in tries:
+        code, _ = await run_proc(cmd, st)
+        if code == 0 and out_path.exists() and out_path.stat().st_size > 0:
+            with contextlib.suppress(Exception):
+                path.unlink()
+            st["note"] = ""
+            how = "کپی بدون افت" if (v_ok and a_ok) else \
+                  ("تبدیل به H.264" if not v_ok else "صدا به AAC")
+            print("[media] %s | کدک %s/%s ⇒ %s | %sx%s %ss" % (
+                out_path.name, v or "?", a or "-", how, w, h, dur), flush=True)
+            return out_path, "", meta
         with contextlib.suppress(Exception):
-            path.unlink()
-        st["note"] = ""
-        return out_path, "", meta
-    # اگر bsf باعث خطا شد، بدون آن یک‌بار دیگر
-    cmd2 = [c for c in cmd if c != "aac_adtstoasc"]
-    code2, _ = await run_proc(cmd2, st)
-    if code2 == 0 and out_path.exists() and out_path.stat().st_size > 0:
-        with contextlib.suppress(Exception):
-            path.unlink()
-        st["note"] = ""
-        return out_path, "", meta
+            if out_path.exists():
+                out_path.unlink()
+    print("[media] ⚠️ تبدیل نشد: %s (کدک %s/%s)" % (path.name, v or "?", a or "-"),
+          flush=True)
     return path, "remux-failed", meta
 
 
@@ -1243,7 +1278,15 @@ async def extract_frames(video: Path, folder: Path, dur: float, st: dict,
 
 
 def thumb_dims(w: int, h: int, box: int = 320) -> tuple[int, int]:
-    """اندازهٔ تامبنیل با همان تناسبِ ویدیو (تا در چت کشیده نشود)."""
+    """اندازهٔ تامبنیل.
+
+    • VIDEO_SQUARE=1 (پیش‌فرض): مربع ۳۲۰×۳۲۰ — خواستهٔ کاربر، تا کادرِ ویدیو در
+      چت مربع باشد (موقع پخش، خودِ فیلم دست‌نخورده پخش می‌شود).
+    • وگرنه: با همان تناسبِ ویدیو (تا در چت کشیده نشود).
+    """
+    if VIDEO_SQUARE:
+        side = box - (box % 2)
+        return side, side
     if w <= 0 or h <= 0:
         return 320, 180
     if w >= h:                                  # افقی
@@ -1289,6 +1332,24 @@ async def make_thumb(frame: Path, folder: Path, st: dict,
         if code == 0 and dst.exists() and 0 < dst.stat().st_size <= 200 * 1024:
             return dst
     return None
+
+
+def video_stored(res) -> dict:
+    """آنچه تلگرام واقعاً ذخیره کرده — از پاسخِ sendVideo (برای اطمینان از تامبنیل/مدت)."""
+    msg = res if isinstance(res, dict) else {}
+    v = msg.get("video") or msg.get("audio") or msg.get("document") or {}
+    if not isinstance(v, dict):
+        v = {}
+    th = v.get("thumbnail") or v.get("thumb") or {}
+    return {
+        "msg": int(msg.get("message_id") or 0),
+        "w": int(v.get("width") or 0),
+        "h": int(v.get("height") or 0),
+        "dur": int(v.get("duration") or 0),
+        "thumb": bool(th),
+        "thumb_wh": ("%sx%s" % (th.get("width"), th.get("height"))) if th else "-",
+        "mime": str(v.get("mime_type") or ""),
+    }
 
 
 def link_label(url: str) -> str:
@@ -1815,13 +1876,14 @@ class Bot:
                                 int(meta.get("width") or 0), int(meta.get("height") or 0))
                             if thumb_path:
                                 fw, fh = await probe_frame_size(frames[idx])
-                                lg.add("thumb", "تامبنیل از عکس %d: عکس %dx%d → تامبنیل %dx%d "
-                                      "(هم‌نسبتِ ویدیو %sx%s) · %s" % (
-                                          idx + 1, fw, fh, *thumb_dims(
-                                              int(meta.get("width") or 0) or fw,
-                                              int(meta.get("height") or 0) or fh),
-                                          meta.get("width"), meta.get("height"),
-                                          human(thumb_path.stat().st_size)))
+                                tw, th_ = thumb_dims(int(meta.get("width") or 0) or fw,
+                                                     int(meta.get("height") or 0) or fh)
+                                lg.add("thumb", "تامبنیل از عکس %d: عکس %dx%d → تامبنیل %dx%d (%s) · %s"
+                                      % (idx + 1, fw, fh, tw, th_,
+                                         "کادرِ مربعِ چت" if VIDEO_SQUARE else
+                                         "هم‌نسبتِ ویدیو %sx%s" % (meta.get("width"),
+                                                                   meta.get("height")),
+                                         human(thumb_path.stat().st_size)))
                             else:
                                 lg.add("thumb", "ساخت تامبنیل ناموفق بود")
                         else:
@@ -1843,9 +1905,11 @@ class Bot:
                     lg.add("meta", "⚠️ مدت فایل خوانده نشد — ممکن است 00:00 بماند")
 
                 # تامبنیل باید همیشه باشد (وگرنه تلگرام کادرِ سیاه نشان می‌دهد)
+                spare_done = False
                 if kind == "video" and not thumb_skipped and not thumb_path:
                     vdur = float(meta.get("duration") or 0)
                     lg.add("thumb", "تامبنیل نبود ⇒ از وسط فیلم می‌سازم (%.1fs)" % (vdur / 2))
+                    spare_done = True
                     spare = await extract_frames(path, folder, vdur, st, 1)
                     if spare:
                         thumb_path = await make_thumb(
@@ -1853,10 +1917,19 @@ class Bot:
                             int(meta.get("width") or 0), int(meta.get("height") or 0))
                         lg.add("thumb", "تامبنیلِ جایگزین: %s" % (
                             human(thumb_path.stat().st_size) if thumb_path else "ناموفق"))
-                # اگر عکسی که کاربر انتخاب کرده بود سالم نبود، همان‌جا بساز
+                # اگر عکسی که کاربر انتخاب کرده بود سالم نبود، همان‌جا از نو بساز
                 if kind == "video" and thumb_path and not thumb_path.exists():
-                    lg.add("thumb", "فایل تامبنیل نبود ⇒ دوباره می‌سازم")
+                    lg.add("thumb", "فایلِ تامبنیل نبود ⇒ از نو می‌سازم")
                     thumb_path = None
+                if kind == "video" and not thumb_path and not thumb_skipped and not spare_done:
+                    vdur = float(meta.get("duration") or 0)
+                    spare = await extract_frames(path, folder, vdur, st, 1)
+                    if spare:
+                        thumb_path = await make_thumb(
+                            spare[0], folder, st,
+                            int(meta.get("width") or 0), int(meta.get("height") or 0))
+                    lg.add("thumb", "تامبنیلِ اضطراری: %s" % (
+                        human(thumb_path.stat().st_size) if thumb_path else "ناموفق"))
 
                 # ── آپلود با نوار مربعی ──
                 st.update({"stage": "upload", "pct": 0, "done": 0, "total": size,
@@ -1895,75 +1968,130 @@ class Bot:
                     extra_note = ("ℹ️ کدک این فایل داخل mp4 پشتیبانی نمی‌شود، پس به‌شکل "
                                   "فایل (نه ویدیو) فرستاده شد.")
                 caption = build_caption(title, descr, probe.url, size, meta, extra_note)
-                form = aiohttp.FormData()
-                form.add_field("chat_id", str(job.chat_id))
-                if job.reply_to:
-                    form.add_field("reply_to_message_id", str(job.reply_to))
-                form.add_field("caption", caption)
-                form.add_field("parse_mode", "HTML")
+                note_out = ""
                 field = {"video": "video", "audio": "audio", "document": "document"}[kind]
                 method = {"video": "sendVideo", "audio": "sendAudio",
                           "document": "sendDocument"}[kind]
-                if kind == "video":
-                    form.add_field("supports_streaming", "true")
-                    for k in ("duration", "width", "height"):
-                        with contextlib.suppress(Exception):
-                            val = int(meta.get(k) or 0)
-                            if val > 0:
-                                form.add_field(k, str(val))
-                thumb_fh = None
-                if thumb_path and thumb_path.exists():
-                    thumb_fh = open(thumb_path, "rb")
-                    form.add_field("thumbnail", thumb_fh, filename="thumb.jpg",
-                                   content_type="image/jpeg")
-                form.add_field(field, stream, filename=path.name,
-                               content_type="application/octet-stream")
+
+                def send_dims() -> tuple[int, int]:
+                    """ابعادِ اعلامی به تلگرام: مربع (خواستهٔ کاربر) وگرنه ابعادِ واقعی."""
+                    if VIDEO_SQUARE:
+                        return SQUARE_SIDE, SQUARE_SIDE
+                    return int(meta.get("width") or 0), int(meta.get("height") or 0)
+
+                async def do_send(cap_text: str, use_html: bool,
+                                  th: Optional[Path]) -> dict:
+                    f = aiohttp.FormData()
+                    f.add_field("chat_id", str(job.chat_id))
+                    if job.reply_to:
+                        f.add_field("reply_to_message_id", str(job.reply_to))
+                    f.add_field("caption", cap_text)
+                    if use_html:
+                        f.add_field("parse_mode", "HTML")
+                    if kind == "video":
+                        f.add_field("supports_streaming", "true")
+                        w2, h2 = send_dims()
+                        for k, val in (("duration", int(meta.get("duration") or 0)),
+                                       ("width", w2), ("height", h2)):
+                            if int(val) > 0:
+                                f.add_field(k, str(int(val)))
+                    fh = None
+                    if th is not None and th.exists():
+                        fh = open(th, "rb")
+                        f.add_field("thumbnail", fh, filename="thumb.jpg",
+                                    content_type="image/jpeg")
+                    stream.reopen()                # aiohttp فایل را بعد از ارسال می‌بندد
+                    f.add_field(field, stream, filename=path.name,
+                                content_type="application/octet-stream")
+                    try:
+                        return await self.tg.call(method, form=f, timeout=7200) or {}
+                    finally:
+                        if fh is not None:
+                            with contextlib.suppress(Exception):
+                                fh.close()
+
                 try:
                     await self.tg.action(job.chat_id,
                                          "upload_video" if kind == "video" else "upload_document")
+                    sw, sh_ = send_dims()
+                    print("[send] %s | نوع=%s | %s | اعلامی=%sx%s مدت=%s | تامبنیل=%s" % (
+                        path.name, kind, human(size), sw, sh_, meta.get("duration"),
+                        thumb_path.name if thumb_path else "-"), flush=True)
                     try:
-                        await self.tg.call(method, form=form, timeout=7200)
+                        res = await do_send(caption, True, thumb_path)
                     except RuntimeError as e:
                         # اگر مشکل فقط کپشن باشد (خطای تجزیهٔ HTML)، ساده بفرست
                         if "caption" not in str(e).lower() and "entit" not in str(e).lower():
                             raise
-                        lg.add("upload", "کپشن HTML رد شد (%s) — با متن ساده دوباره" % str(e)[:120])
-                        plain = "%s\n\n%s" % ((descr or title or "").strip(), probe.url.strip())
-                        form2 = aiohttp.FormData()
-                        form2.add_field("chat_id", str(job.chat_id))
-                        if job.reply_to:
-                            form2.add_field("reply_to_message_id", str(job.reply_to))
-                        form2.add_field("caption", plain.strip()[:1024])
-                        if kind == "video":
-                            form2.add_field("supports_streaming", "true")
-                            for k in ("duration", "width", "height"):
-                                if meta.get(k):
-                                    form2.add_field(k, str(int(meta[k])))
-                        if thumb_path and thumb_path.exists():
-                            form2.add_field("thumbnail",
-                                            open(thumb_path, "rb"), filename="thumb.jpg",
-                                            content_type="image/jpeg")
-                        stream.seek(0)
-                        form2.add_field(field, stream, filename=path.name,
-                                        content_type="application/octet-stream")
-                        await self.tg.call(method, form=form2, timeout=7200)
+                        lg.add("upload", "کپشن HTML رد شد (%s) — با متن ساده دوباره"
+                               % str(e)[:120])
+                        plain = "%s\n\n%s" % ((descr or title or "").strip(),
+                                              probe.url.strip())
+                        res = await do_send(plain.strip()[:1024], False, thumb_path)
+                    got = video_stored(res)
+                    print("[send] تلگرام ذخیره کرد: %sx%s مدت=%s تامبنیل=%s" % (
+                        got["w"], got["h"], got["dur"],
+                        ("دارد " + got["thumb_wh"]) if got["thumb"] else "ندارد"), flush=True)
+                    lg.add("send", "ذخیره‌شده در تلگرام: %sx%s · مدت %ss · تامبنیل %s" % (
+                        got["w"], got["h"], got["dur"],
+                        ("دارد " + got["thumb_wh"]) if got["thumb"] else "ندارد"))
+                    # اگر تلگرام تامبنیل/مدت را ذخیره نکرد ⇒ یک بار دیگر با عکسِ تازه
+                    if (kind == "video" and REPAIR_SEND
+                            and (got["dur"] <= 0
+                                 or (not thumb_skipped and not got["thumb"]))):
+                        lg.add("upload", "⚠️ تلگرام تامبنیل/مدت را نگرفت ⇒ یک بار دیگر "
+                                         "با عکسِ تازه می‌فرستم")
+                        print("[send] repair: thumb=%s dur=%s" % (got["thumb"], got["dur"]),
+                              flush=True)
+                        if job.msg_id:
+                            with contextlib.suppress(Exception):
+                                await self.tg.edit(job.chat_id, job.msg_id,
+                                                   "🔁 یک بار دیگر با عکسِ تازه می‌فرستم…")
+                        thumb2 = None
+                        sp = await extract_frames(path, folder,
+                                                  float(meta.get("duration") or 0), st, 1)
+                        if sp:
+                            thumb2 = await make_thumb(sp[0], folder, st,
+                                                      int(meta.get("width") or 0),
+                                                      int(meta.get("height") or 0))
+                        holder["n"] = 0.0
+                        holder["t0"] = time.time()
+                        res2 = await do_send(caption, True, thumb2 or thumb_path)
+                        got2 = video_stored(res2)
+                        print("[send] نتیجهٔ ترمیم: %sx%s مدت=%s تامبنیل=%s" % (
+                            got2["w"], got2["h"], got2["dur"],
+                            ("دارد " + got2["thumb_wh"]) if got2["thumb"] else "ندارد"),
+                            flush=True)
+                        if got2["thumb"] and got2["dur"] > 0:
+                            lg.add("upload", "✅ ترمیم شد (تامبنیل=%s · مدت=%ss)"
+                                   % (got2["thumb_wh"], got2["dur"]))
+                            if got["msg"]:
+                                with contextlib.suppress(Exception):
+                                    await self.tg.call("deleteMessage", {
+                                        "chat_id": job.chat_id,
+                                        "message_id": got["msg"]})
+                        else:
+                            note_out = ("\n⚠️ تلگرام تامبنیل/زمانِ این فایل را قبول نکرد "
+                                        "(اگر کادر خالی بود بگو تا از راه دیگری بروم).")
+                            lg.add("upload", "⚠️ تلگرام تامبنیل/زمان را قبول نکرد: "
+                                             "%sx%s · مدت %ss · تامبنیل %s" % (
+                                                 got2["w"], got2["h"], got2["dur"],
+                                                 "دارد" if got2["thumb"] else "ندارد"))
                 finally:
                     utick.cancel()
                     with contextlib.suppress(asyncio.CancelledError, Exception):
                         await utick
                     with contextlib.suppress(Exception):
                         stream.close()
-                    if thumb_fh is not None:
-                        with contextlib.suppress(Exception):
-                            thumb_fh.close()
                 lg.add("upload", "موفق: %s به‌شکل %s در %s" % (
                     human(size), kind, hhmmss(time.time() - holder["t0"])))
                 lg.add("done", "کل زمان: %s" % lg.elapsed)
                 _set_last_log(lg, True)          # ✅ موفق ⇒ لاگ پاک می‌شود
                 if job.msg_id:
                     await self.tg.edit(job.chat_id, job.msg_id,
-                                       "✅ ارسال شد  ·  %s  ·  %s" % (human(size),
-                                                                      hhmmss(time.time() - holder["t0"])))
+                                       "✅ ارسال شد  ·  %s  ·  %s%s" % (
+                                           human(size), hhmmss(time.time() - holder["t0"]),
+                                           note_out))
         except asyncio.CancelledError:
             if job.msg_id:
                 asyncio.create_task(self.tg.edit(job.chat_id, job.msg_id, "🛑 لغو شد."))
