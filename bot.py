@@ -43,7 +43,7 @@ from typing import Optional
 import aiohttp
 
 START_TS = time.time()
-VERSION = "2.8"
+VERSION = "2.10"
 
 
 def _env(name: str, default: str = "") -> str:
@@ -583,13 +583,14 @@ class Telegram:
 
 
 class Option:
-    __slots__ = ("key", "label", "selector", "est", "audio", "direct", "url")
+    __slots__ = ("key", "label", "selector", "est", "audio", "direct", "url", "approx")
 
     def __init__(self, key: str, label: str, selector: str, est: int = 0,
-                 audio: bool = False, direct: bool = False, url: str = ""):
+                 audio: bool = False, direct: bool = False, url: str = "",
+                 approx: bool = False):
         self.key, self.label, self.selector = key, label, selector
         self.est, self.audio, self.direct = est, audio, direct
-        self.url = url
+        self.url, self.approx = url, approx
 
 
 class Probe:
@@ -599,15 +600,68 @@ class Probe:
         self.duration, self.options, self.direct, self.thumb = duration, options, direct, thumb
 
 
-def _fmt_size(f: dict) -> int:
+def _fmt_size(f: dict, duration: int = 0) -> int:
+    """حجم فرمت: مقدار دقیق اگر باشد، وگرنه تخمینِ بیت‌ریت × مدت."""
     for k in ("filesize", "filesize_approx"):
         v = f.get(k)
         if v:
             try:
-                return int(v)
+                n = int(v)
+                if n > 0:
+                    return n
             except Exception:
                 pass
+    dur = int(duration or f.get("duration") or 0)
+    if dur > 0:
+        bits = 0.0
+        for k in ("vbr", "abr"):
+            with contextlib.suppress(Exception):
+                bits += float(f.get(k) or 0)
+        if bits <= 0:
+            with contextlib.suppress(Exception):
+                bits = float(f.get("tbr") or 0)
+        if bits > 0:
+            return int(bits * 1000.0 / 8.0 * dur)
     return 0
+
+
+def _fmt_size_exact(f: dict) -> bool:
+    """آیا حجم «دقیق» است (نه تخمینی)؟"""
+    for k in ("filesize", "filesize_approx"):
+        with contextlib.suppress(Exception):
+            if int(f.get(k) or 0) > 0:
+                return True
+    return False
+
+
+async def fill_sizes_from_head(formats: list[dict], limit: int = 6) -> int:
+    """برای فرمت‌های بدون حجم، با HEAD حجم واقعی را می‌گیرد (فایل‌های تدریجی)."""
+    todo = []
+    for f in formats:
+        if not isinstance(f, dict) or _fmt_size_exact(f):
+            continue
+        u = str(f.get("url") or "")
+        proto = str(f.get("protocol") or "").lower()
+        if not u.lower().startswith(("http://", "https://")):
+            continue
+        if "m3u8" in proto or "dash" in proto or u.lower().split("?")[0].endswith(
+                (".m3u8", ".mpd")):
+            continue                     # پخش‌های قطعه‌ای: HEAD حجم کل نمی‌دهد
+        todo.append((f, u))
+    todo = todo[:max(0, limit)]
+    if not todo:
+        return 0
+    got = 0
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as sess:
+            for f, u in todo:
+                n, _ = await remote_size(sess, u)
+                if n > 0:
+                    f["filesize"] = n
+                    got += 1
+    except Exception:
+        pass
+    return got
 
 
 def _codec_roles(f: dict) -> str:
@@ -633,56 +687,82 @@ def _codec_roles(f: dict) -> str:
 def _options_from_info(info: dict, url: str) -> Probe:
     formats = [f for f in (info.get("formats") or []) if isinstance(f, dict)]
     if info.get("url"):
-        formats.append(info)      # بعضی سایت‌ها فقط یک فرمتِ سرِ info می‌دهند
-    by_h: dict[int, dict] = {}
-    audio_best = 0
-    muxed: dict[int, int] = {}
-    video_any = 0                 # بزرگ‌ترین حجمِ هر چیزِ ویدیویی (حتی بی‌ارتفاع)
+        formats.append(info)          # بعضی سایت‌ها فقط یک فرمتِ سرِ info می‌دهند
+    info_dur = int(info.get("duration") or 0)
+
+    noh: list[tuple[float, str, int, bool]] = []   # (kbps، format_id، حجم، دقیق؟)
+    by_h: dict[int, int] = {}         # ارتفاع → حجم ویدیو
+    by_h_exact: dict[int, bool] = {}
+    muxed: dict[int, int] = {}        # ارتفاع → حجم فایل کامل
+    muxed_exact: dict[int, bool] = {}
+    audio_best, audio_exact = 0, False
+    video_any, video_any_exact = 0, False
     has_video = False
+
     for f in formats:
         role = _codec_roles(f)
         h = int(f.get("height") or 0)
-        size = _fmt_size(f)
-        if role == "muxed":
+        size = _fmt_size(f, info_dur)
+        exact = _fmt_size_exact(f)
+        if role in ("muxed", "video", "unknown"):
             has_video = True
+            if size >= video_any:
+                video_any, video_any_exact = size, exact
+            if not h:
+                kb = 0.0
+                for k in ("tbr", "vbr"):
+                    with contextlib.suppress(Exception):
+                        kb = max(kb, float(f.get(k) or 0))
+                if kb > 0:
+                    noh.append((kb, str(f.get("format_id") or ""), size, exact))
             if h:
-                muxed[h] = max(muxed.get(h, 0), size)
-            video_any = max(video_any, size)
-        elif role == "video":
-            has_video = True
-            if h:
-                cur = by_h.get(h) or {"v": 0}
-                cur["v"] = max(cur.get("v", 0), size)
-                by_h[h] = cur
-            video_any = max(video_any, size)
-        elif role == "unknown":     # بدون اطلاعات کدک ⇒ کاندیدِ فایل کامل
-            has_video = True
-            if h:
-                muxed[h] = max(muxed.get(h, 0), size)
-            video_any = max(video_any, size)
+                if role == "video" and size > by_h.get(h, 0):
+                    by_h[h], by_h_exact[h] = size, exact
+                elif role != "video" and size > muxed.get(h, 0):
+                    muxed[h], muxed_exact[h] = size, exact
         elif role == "audio":
-            audio_best = max(audio_best, size)
+            if size >= audio_best:
+                audio_best, audio_exact = size, exact
 
     heights = sorted(set(by_h) | set(muxed), reverse=True)
     heights = [h for h in heights if h >= 144][:MAX_OPTIONS]
     options: list[Option] = []
     for h in heights:
-        if h in muxed and (h not in by_h or muxed[h] >= by_h[h].get("v", 0)):
+        use_muxed = h in muxed and (h not in by_h or muxed[h] >= by_h.get(h, 0))
+        if use_muxed:
             est = muxed[h]
+            approx = not muxed_exact.get(h, False)
         else:
-            est = by_h.get(h, {}).get("v", 0) + audio_best
+            est = by_h.get(h, 0) + audio_best
+            approx = not (by_h_exact.get(h, False) and audio_exact)
         options.append(Option("h%d" % h, "%dp" % h,
-                              "bv*[height<=%d]+ba/b[height<=%d]/b" % (h, h), est))
-    # راهِ نجات: ویدیو هست ولی کیفیت‌ها ارتفاع ندارند ⇒ «بهترین کیفیت» را بگذار
+                              "bv*[height<=%d]+ba/b[height<=%d]/b" % (h, h),
+                              est, approx=bool(est) and approx))
+    # راهِ نجات: کیفیت‌ها ارتفاع ندارند ولی بیت‌ریتشان متفاوت است (HLS) ⇒
+    # هر کیفیت یک گزینه (با انتخاب دقیق همان فرمت در yt-dlp).
     if not options and has_video:
-        options.append(Option("best", "🎥 بهترین کیفیت موجود", "b", video_any))
-    dur = int(info.get("duration") or 0)
-    if dur or audio_best or formats:
-        options.append(Option("audio", "فقط صدا (mp3)", "ba/b", audio_best, audio=True))
+        uniq: dict[float, tuple[float, str, int, bool]] = {}
+        for kb, fid, size, exact in noh:
+            if fid and kb not in uniq:
+                uniq[kb] = (kb, fid, size, exact)
+        ladder = sorted(uniq.values(), reverse=True)[:MAX_OPTIONS]
+        if len(ladder) >= 2:
+            for kb, fid, size, exact in ladder:
+                lbl = ("%.1f Mbps" % (kb / 1000.0)) if kb >= 1000 else ("%d kbps" % int(kb))
+                options.append(Option("f%s" % fid, "🎥 کیفیت %s" % lbl, fid, size,
+                                      approx=bool(size) and not exact))
+        else:
+            options.append(Option("best", "🎥 بهترین کیفیت موجود", "b", video_any,
+                                  approx=bool(video_any) and not video_any_exact))
+    if audio_best <= 0 and info_dur and has_video:
+        audio_best, audio_exact = int(128000 / 8 * info_dur), False   # تخمین صدای معمول
+    if info_dur or audio_best or formats:
+        options.append(Option("audio", "فقط صدا (mp3)", "ba/b", audio_best,
+                              audio=True, approx=bool(audio_best) and not audio_exact))
     title = str(info.get("title") or "").strip()
     descr = str(info.get("description") or "").strip()
     thumb = str(info.get("thumbnail") or "")
-    return Probe(str(info.get("webpage_url") or url), title, descr, dur, options,
+    return Probe(str(info.get("webpage_url") or url), title, descr, info_dur, options,
                  direct=False, thumb=thumb)
 
 
@@ -734,6 +814,30 @@ def _page_candidates(doc: str, base: str) -> list[str]:
     return clean[:8]
 
 
+async def remote_size(sess: aiohttp.ClientSession, url: str) -> tuple[int, str]:
+    """حجم و نوعِ فایل روی سرور: اول HEAD، اگر نشد یک درخواست کوچکِ Range."""
+    size, ctype = 0, ""
+    with contextlib.suppress(Exception):
+        async with sess.head(url, headers={"User-Agent": UA}, allow_redirects=True) as r:
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            if r.status < 400:
+                size = int(r.headers.get("Content-Length") or 0)
+    if size:
+        return size, ctype
+    with contextlib.suppress(Exception):
+        async with sess.get(url, headers={"User-Agent": UA, "Range": "bytes=0-1"},
+                            allow_redirects=True) as r:
+            if not ctype:
+                ctype = (r.headers.get("Content-Type") or "").lower()
+            cr = r.headers.get("Content-Range") or ""
+            if "/" in cr:
+                with contextlib.suppress(Exception):
+                    size = int(cr.rsplit("/", 1)[1])
+            if not size and r.status < 400:
+                size = int(r.headers.get("Content-Length") or 0)
+    return size, ctype
+
+
 async def page_video_scan(url: str) -> tuple[list[Option], str]:
     """صفحه را می‌خواند و آدرس‌های ویدیوییِ داخلش را با حجم برمی‌گرداند."""
     if not url.lower().startswith(("http://", "https://")):
@@ -761,17 +865,11 @@ async def page_video_scan(url: str) -> tuple[list[Option], str]:
     opts: list[Option] = []
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as sess:
         for i, u in enumerate(cands):
-            size, ok = 0, True
-            with contextlib.suppress(Exception):
-                async with sess.head(u, headers={"User-Agent": UA},
-                                     allow_redirects=True) as hr:
-                    size = int(hr.headers.get("Content-Length") or 0)
-                    ct = (hr.headers.get("Content-Type") or "").lower()
-                    if hr.status >= 400 or (ct and not ct.startswith(
-                            ("video/", "audio/", "application/octet-stream",
-                             "application/vnd.apple.mpegurl", "application/x-mpegurl"))):
-                        ok = False
-            if not ok:
+            size, ct = await remote_size(sess, u)
+            if ct and not ct.startswith(
+                    ("video/", "audio/", "application/octet-stream",
+                     "application/vnd.apple.mpegurl", "application/x-mpegurl",
+                     "binary/octet-stream")):
                 continue
             name = os.path.basename(u.split("?")[0].rstrip("/")) or ("video%d" % (i + 1))
             opts.append(Option("src%d" % i, "🎥 %s" % cut(name, 34), "", size,
@@ -782,18 +880,20 @@ async def page_video_scan(url: str) -> tuple[list[Option], str]:
 
 async def _direct_probe(url: str) -> Optional[Probe]:
     """لینک مستقیمِ فایل (mp4/…): با HEAD حجم و نام را می‌گیریم."""
+    if url.lower().split("?")[0].endswith((".m3u8", ".mpd")):
+        return None                    # پخش قطعه‌ای: با yt-dlp می‌رود، نه aria2
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25)) as s:
-            async with s.head(url, allow_redirects=True, headers={"User-Agent": UA}) as r:
-                ctype = (r.headers.get("Content-Type") or "").lower()
-                size = int(r.headers.get("Content-Length") or 0)
-                disp = (r.headers.get("Content-Disposition") or "")
-                if (ctype.startswith(("video/", "audio/", "application/octet-stream"))
-                        or "attachment" in disp.lower() or url.split("?")[0].lower().endswith(
-                            tuple(VIDEO_EXT | AUDIO_EXT | FILE_EXT))):
-                    name = os.path.basename(url.split("?")[0].rstrip("/")) or "file"
-                    opt = Option("direct", "%s" % cut(name, 40), "", size, direct=True, url=url)
-                    return Probe(url, name, "", 0, [opt], direct=True)
+            size, ctype = await remote_size(s, url)
+            if ctype.startswith(("application/vnd.apple.mpegurl", "application/x-mpegurl",
+                                 "application/dash+xml")):
+                return None
+            if (ctype.startswith(("video/", "audio/", "application/octet-stream"))
+                    or url.split("?")[0].lower().endswith(
+                        tuple(VIDEO_EXT | AUDIO_EXT | FILE_EXT))):
+                name = os.path.basename(url.split("?")[0].rstrip("/")) or "file"
+                opt = Option("direct", "%s" % cut(name, 40), "", size, direct=True, url=url)
+                return Probe(url, name, "", 0, [opt], direct=True)
     except Exception:
         return None
     return None
@@ -821,6 +921,11 @@ async def probe_url(url: str) -> tuple[Optional[Probe], str]:
                         if js:
                             break
                 if js and (js.get("formats") or js.get("url")):
+                    fmts = [f for f in (js.get("formats") or []) if isinstance(f, dict)]
+                    if fmts:
+                        n = await fill_sizes_from_head(fmts)
+                        if n:
+                            print("[probe] 📏 حجم %d فرمت با HEAD گرفته شد" % n, flush=True)
                     cand = _options_from_info(js, url)
                     if cand.options:
                         p = cand
@@ -1068,8 +1173,15 @@ def menu_text(p: Probe) -> str:
     lines.append("")
     lines.append("یک کیفیت را انتخاب کن:")
     for i, o in enumerate(p.options, 1):
-        sz = human(o.est) if o.est else "حجم نامعلوم"
+        if o.est:
+            sz = ("≈ %s" % human(o.est)) if o.approx else human(o.est)
+        else:
+            sz = "حجم نامعلوم"
         lines.append("%d. %s — %s" % (i, o.label, sz))
+    if any(o.approx for o in p.options):
+        lines.append("")
+        lines.append("ℹ️ علامت «≈» یعنی حجمِ تقریبی (سایت حجم دقیق نمی‌دهد، "
+                     "از بیت‌ریت و مدت حساب می‌شود).")
     if not any(not o.audio for o in p.options):
         lines.append("")
         lines.append("⚠️ از این لینک ویدیویی پیدا نشد (فقط صدا). اگر باید ویدیو داشته "
