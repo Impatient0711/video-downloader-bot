@@ -43,7 +43,7 @@ from typing import Optional
 import aiohttp
 
 START_TS = time.time()
-VERSION = "2.10"
+VERSION = "2.11"
 
 
 def _env(name: str, default: str = "") -> str:
@@ -73,6 +73,9 @@ _DEF_CAP = 2000 if LOCAL_API else 49
 MAX_UPLOAD_MB = int(_env("MAX_UPLOAD_MB", "0") or 0) or _DEF_CAP
 MAX_DOWNLOAD_MB = int(_env("MAX_DOWNLOAD_MB", str(max(2200, _DEF_CAP + 400))))
 MAX_CONCURRENT = max(1, int(_env("MAX_CONCURRENT", "2")))
+THUMB_CHOICE = (_env("THUMB_CHOICE", "1") or "1").strip().lower() not in ("0", "no", "false", "off")
+THUMB_FRAMES = max(2, min(8, int(_env("THUMB_FRAMES", "5"))))
+THUMB_WAIT_S = max(10, int(_env("THUMB_WAIT_S", "180")))
 DISK_LIMIT_MB = int(_env("DISK_LIMIT_MB", "6000"))
 
 DOWNLOADER = _env("DOWNLOADER", "auto").lower()      # auto | ytdlp | aria2
@@ -550,6 +553,32 @@ class Telegram:
                        content_type="text/plain; charset=utf-8")
         return await self.call("sendDocument", form=form, timeout=300)
 
+    async def send_album(self, chat_id: int, frames: list, caption: str = "", kb=None):
+        """چند عکس را یک‌جا (آلبوم) می‌فرستد — برای انتخاب تامبنیل."""
+        form = aiohttp.FormData()
+        form.add_field("chat_id", str(chat_id))
+        media = []
+        for i, f in enumerate(frames):
+            item = {"type": "photo", "media": "attach://f%d" % i}
+            if i == 0 and caption:
+                item["caption"] = caption[:1024]
+                item["parse_mode"] = "HTML"
+            media.append(item)
+        form.add_field("media", json.dumps(media))
+        if kb:
+            form.add_field("reply_markup", json.dumps(kb))
+        handles = []
+        for i, f in enumerate(frames):
+            fh = open(f, "rb")
+            handles.append(fh)
+            form.add_field("f%d" % i, fh, filename=f.name, content_type="image/jpeg")
+        try:
+            return await self.call("sendMediaGroup", form=form, timeout=300)
+        finally:
+            for fh in handles:
+                with contextlib.suppress(Exception):
+                    fh.close()
+
     async def send_media(self, chat_id: int, path: Path, kind: str, caption: str,
                          reply_to: int = 0, meta: Optional[dict] = None):
         """ارسال فایل؛ برای فایل‌های بزرگ به‌صورت جریانی (رم پر نمی‌شود)."""
@@ -569,6 +598,10 @@ class Telegram:
             for k in ("duration", "width", "height"):
                 if meta and meta.get(k):
                     form.add_field(k, str(int(meta[k])))
+            th = (meta or {}).get("thumb_file")
+            if th and Path(th).exists():
+                form.add_field("thumbnail", open(th, "rb"), filename="thumb.jpg",
+                               content_type="image/jpeg")
         stream = ProgressFile(path, lambda n, t: None)
         form.add_field(field, stream, filename=path.name,
                        content_type="application/octet-stream")
@@ -1134,32 +1167,71 @@ async def to_sendable_video(path: Path, folder: Path, st: dict) -> tuple[Path, s
 # ─────────────────────────── کپشن ───────────────────────────
 
 
+def _frame_times(dur: float, n: int) -> list[float]:
+    """زمان‌هایی که از فیلم عکس می‌گیریم (اگر مدت معلوم نباشد، ثانیه‌های ثابت)."""
+    if dur and dur > 5:
+        start, end = dur * 0.08, dur * 0.92
+        if n <= 1:
+            return [dur / 2.0]
+        step = (end - start) / (n - 1)
+        return [start + step * i for i in range(n)]
+    return [10.0, 60.0, 180.0, 420.0, 900.0, 1500.0, 2400.0, 3600.0][:n]
+
+
+async def extract_frames(video: Path, folder: Path, dur: float, st: dict,
+                         n: int = 5) -> list[Path]:
+    """چند عکس از تایم‌های مختلف فیلم می‌گیرد (برای انتخاب تامبنیل)."""
+    if not shutil.which("ffmpeg"):
+        return []
+    out: list[Path] = []
+    st["note"] = "🖼 گرفتن عکس از داخل فیلم…"
+    for i, t in enumerate(_frame_times(dur, n)):
+        dst = folder / ("frame%d.jpg" % i)
+        with contextlib.suppress(Exception):
+            if dst.exists():
+                dst.unlink()
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+               "-ss", "%.2f" % t, "-i", str(video), "-frames:v", "1",
+               "-vf", "scale=480:-2", "-q:v", "4", str(dst)]
+        code, _ = await run_proc(cmd, st)
+        if code == 0 and dst.exists() and dst.stat().st_size > 0:
+            out.append(dst)
+    st["note"] = ""
+    return out
+
+
+async def make_thumb(frame: Path, folder: Path, st: dict) -> Optional[Path]:
+    """از عکس انتخابی، تامبنیلِ استاندارد تلگرام می‌سازد (<۲۰۰KB و ≤۳۲۰px)."""
+    if not shutil.which("ffmpeg"):
+        return None
+    dst = folder / "thumb.jpg"
+    for scale, quality in (("320:-2", "6"), ("320:-2", "12"), ("256:-2", "18")):
+        with contextlib.suppress(Exception):
+            if dst.exists():
+                dst.unlink()
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error", "-i", str(frame),
+               "-frames:v", "1", "-vf", "scale=%s" % scale, "-q:v", quality, str(dst)]
+        code, _ = await run_proc(cmd, st)
+        if code == 0 and dst.exists() and 0 < dst.stat().st_size <= 200 * 1024:
+            return dst
+    return None
+
+
 def build_caption(title: str, description: str, url: str, size: int,
                   meta: dict, extra: str = "") -> str:
-    head = html.escape(cut(title or "ویدیو", 150))
-    bits = []
-    if meta.get("duration"):
-        bits.append("⏱ " + hhmmss(meta["duration"]))
-    if meta.get("height"):
-        bits.append("🎬 %dp" % meta["height"])
-    if size:
-        bits.append("💾 " + human(size))
-    lines = ["<b>%s</b>" % head]
-    if bits:
-        lines.append(" · ".join(bits))
-    if description:
-        lines.append("")
-        lines.append(html.escape(cut(description, 380)))
-    if extra:
-        lines.append("")
-        lines.append(html.escape(extra))
-    lines.append("")
-    lines.append('🔗 لینک اصلی: <a href="%s">%s</a>' % (html.escape(url, quote=True),
-                                                        html.escape(cut(url, 60))))
-    cap = "\n".join(lines)
-    if len(cap) > 1024:                       # کپشن تلگرام حداکثر ۱۰۲۴ کاراکتر
-        keep = 1024 - 90
-        cap = cap[:keep] + "…\n" + '🔗 <a href="%s">لینک اصلی</a>' % html.escape(url, quote=True)
+    """کپشنِ فیلم: توضیحات (یا اسم فیلم) + لینکِ کلیک‌شدنی. چیز دیگری نه."""
+    body = (description or "").strip() or (title or "").strip()
+    link = '<a href="%s">%s</a>' % (html.escape(url, quote=True), html.escape(url))
+    parts = []
+    if body:
+        parts.append(html.escape(body))
+    if extra:                     # فقط وقتی لازم است (مثلاً فایل داکیومنت شد)
+        parts.append(html.escape(extra))
+    parts.append(link)
+    cap = "\n\n".join(parts)
+    if len(cap) > 1024:           # سقف کپشن تلگرام
+        keep = 1024 - len(link) - 8
+        cap = html.escape(body)[:max(0, keep)] + "…\n\n" + link
     return cap
 
 
@@ -1221,6 +1293,7 @@ class Bot:
         self.active: set[Job] = set()
         self.sessions: dict[str, dict] = {}
         self.leech_wait: dict[int, float] = {}   # ‎/leech‎ زده و منتظر لینک است
+        self.thumb_pending: dict[str, dict] = {} # انتخاب تامبنیل (sid → وضعیت)
 
     # ── دسترسی ──
     def allowed(self, uid: int) -> bool:
@@ -1351,6 +1424,47 @@ class Bot:
         await self.tg.edit(chat_id, smid, more_links + menu_text(probe),
                            kb=menu_keyboard(sid, probe))
 
+    # ── انتخاب تامبنیل از عکس‌های داخل فیلم ──
+    async def ask_thumbnail(self, job: "Job", frames: list, lg) -> Optional[int]:
+        """عکس‌ها را می‌فرستد و انتخاب کاربر را می‌گیرد (تایم‌اوت ⇒ عکس وسط)."""
+        sid = secrets.token_hex(3)
+        info: dict = {"uid": job.uid, "event": asyncio.Event(), "set": False,
+                      "choice": None, "chat_id": job.chat_id, "mid": 0, "n": len(frames)}
+        self.thumb_pending[sid] = info
+        row = [{"text": str(i + 1), "callback_data": "tb:%s:%d" % (sid, i)}
+               for i in range(len(frames))]
+        kb = {"inline_keyboard": [row, [{"text": "⏭ بدون عکس", "callback_data": "tb:%s:n" % sid}]]}
+        note = ("🎞 از تایم‌های مختلف فیلم عکس گرفتم.\n"
+                "کدام برای تامبنیل ویدیو باشد؟ (روی شماره بزن)\n"
+                "اگر تا %d ثانیه انتخاب نکنی، عکسِ وسط را می‌گذارم." % THUMB_WAIT_S)
+        try:
+            await self.tg.send_album(job.chat_id, frames, caption=note, kb=kb)
+            lg.add("thumb", "آلبوم %d عکس برای انتخاب تامبنیل ارسال شد" % len(frames))
+        except Exception as e:
+            lg.add("thumb", "ارسال آلبوم نشد (%s) — بدون انتخاب پیش می‌روم" % str(e)[:120])
+            self.thumb_pending.pop(sid, None)
+            return len(frames) // 2
+        try:
+            await asyncio.wait_for(info["event"].wait(), timeout=THUMB_WAIT_S)
+        except asyncio.TimeoutError:
+            pass
+        except asyncio.CancelledError:
+            self.thumb_pending.pop(sid, None)
+            raise
+        self.thumb_pending.pop(sid, None)
+        if info.get("set"):
+            if info.get("choice") == "n":
+                lg.add("thumb", "کاربر «بدون عکس» را انتخاب کرد")
+                return None
+            with contextlib.suppress(Exception):
+                return int(info.get("choice"))
+        lg.add("thumb", "انتخابی نشد ⇒ عکس وسط (مهلت %ds)" % THUMB_WAIT_S)
+        if job.msg_id:
+            with contextlib.suppress(Exception):
+                await self.tg.edit(job.chat_id, job.msg_id,
+                                   "⏳ انتخابی نشد — عکسِ وسط را برای تامبنیل می‌گذارم…")
+        return len(frames) // 2
+
     # ── انتخاب کیفیت (دکمه) ──
     async def on_callback(self, cb: dict):
         data = str(cb.get("data") or "")
@@ -1359,6 +1473,25 @@ class Bot:
         chat_id = int((msg.get("chat") or {}).get("id") or 0)
         mid = int(msg.get("message_id") or 0)
         uid = int((cb.get("from") or {}).get("id") or 0)
+        if data.startswith("tb:"):
+            _, sid, val = (data.split(":", 2) + ["", "", ""])[:3]
+            info = self.thumb_pending.get(sid)
+            if not info or info.get("uid") != uid:
+                await self.tg.answer_cb(cid, "این انتخاب منقضی شده — الان فیلم را می‌فرستم.")
+                return
+            info["set"] = True
+            info["choice"] = val
+            info["event"].set()
+            if val == "n":
+                await self.tg.answer_cb(cid, "باشه، بدون تامبنیل 👌")
+                with contextlib.suppress(Exception):
+                    await self.tg.edit(chat_id, mid, "👍 بدون تامبنیل — الان می‌فرستم…")
+            else:
+                await self.tg.answer_cb(cid, "✅ عکس %s انتخاب شد" % (int(val) + 1))
+                with contextlib.suppress(Exception):
+                    await self.tg.edit(chat_id, mid,
+                                       "✅ عکس انتخاب شد — تامبنیل می‌سازم و فیلم را می‌فرستم…")
+            return
         if data == "log:last":
             await self.tg.answer_cb(cid, "می‌فرستم…")
             await self.send_log(chat_id, uid, 0)
@@ -1558,6 +1691,31 @@ class Bot:
                                        else ("%dMB ≈ %.1fGB" % (MAX_UPLOAD_MB, MAX_UPLOAD_MB / 1024))))
                     return
 
+                # ── انتخاب تامبنیل از داخل فیلم ──
+                thumb_path: Optional[Path] = None
+                if kind == "video" and THUMB_CHOICE:
+                    vdur = float(meta.get("duration") or 0)
+                    if job.msg_id:
+                        with contextlib.suppress(Exception):
+                            await self.tg.edit(job.chat_id, job.msg_id,
+                                               "🖼 دارم از داخل فیلم عکس می‌گیرم…")
+                    frames = await extract_frames(path, folder, vdur, st, THUMB_FRAMES)
+                    lg.add("thumb", "عکس‌های گرفته‌شده: %d" % len(frames))
+                    if frames:
+                        idx = await self.ask_thumbnail(job, frames, lg)
+                        if job.cancelled:
+                            lg.add("cancel", "لغو در مرحلهٔ تامبنیل")
+                            _set_last_log(lg, False, "لغو توسط کاربر")
+                            return
+                        if idx is not None and 0 <= idx < len(frames):
+                            thumb_path = await make_thumb(frames[idx], folder, st)
+                            lg.add("thumb", "تامبنیل از عکس %d ساخته شد (%s)" % (
+                                idx + 1, human(thumb_path.stat().st_size) if thumb_path else "ناموفق"))
+                        else:
+                            lg.add("thumb", "بدون تامبنیل (به‌خواست کاربر)")
+                    else:
+                        lg.add("thumb", "عکسی گرفته نشد (ffmpeg؟)")
+
                 # ── آپلود با نوار مربعی ──
                 st.update({"stage": "upload", "pct": 0, "done": 0, "total": size,
                            "speed": "", "eta": "", "note": ""})
@@ -1609,6 +1767,11 @@ class Bot:
                     for k in ("duration", "width", "height"):
                         if meta.get(k):
                             form.add_field(k, str(int(meta[k])))
+                thumb_fh = None
+                if thumb_path and thumb_path.exists():
+                    thumb_fh = open(thumb_path, "rb")
+                    form.add_field("thumbnail", thumb_fh, filename="thumb.jpg",
+                                   content_type="image/jpeg")
                 form.add_field(field, stream, filename=path.name,
                                content_type="application/octet-stream")
                 try:
@@ -1621,6 +1784,9 @@ class Bot:
                         await utick
                     with contextlib.suppress(Exception):
                         stream.close()
+                    if thumb_fh is not None:
+                        with contextlib.suppress(Exception):
+                            thumb_fh.close()
                 lg.add("upload", "موفق: %s به‌شکل %s در %s" % (
                     human(size), kind, hhmmss(time.time() - holder["t0"])))
                 lg.add("done", "کل زمان: %s" % lg.elapsed)
