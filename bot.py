@@ -43,7 +43,7 @@ from typing import Optional
 import aiohttp
 
 START_TS = time.time()
-VERSION = "2.12"
+VERSION = "2.13"
 
 
 def _env(name: str, default: str = "") -> str:
@@ -1241,10 +1241,11 @@ async def make_thumb(frame: Path, folder: Path, st: dict,
     if not (vw > 0 and vh > 0):
         vw, vh = await probe_frame_size(frame)
     tw, th = thumb_dims(vw, vh)
+    # مهم: به‌جای کشیدنِ عکس، «برش» می‌زنیم تا هیچ‌وقت کشیده نشود
+    cover = ("scale=%d:%d:force_original_aspect_ratio=increase,crop=%d:%d"
+             % (tw, th, tw, th))
     dst = folder / "thumb.jpg"
-    for scale, quality in (("%d:%d" % (tw, th), "6"),
-                           ("%d:%d" % (tw, th), "12"),
-                           ("%d:%d" % (tw, th), "20")):
+    for scale, quality in ((cover, "6"), (cover, "12"), (cover, "20")):
         with contextlib.suppress(Exception):
             if dst.exists():
                 dst.unlink()
@@ -1257,7 +1258,7 @@ async def make_thumb(frame: Path, folder: Path, st: dict,
 
 
 def link_label(url: str) -> str:
-    """متنِ آبیِ لینک: نامِ سایت (اگر نشد، خود لینک)."""
+    """نامِ سایت از آدرس (برای حالتی که متنِ کپشن خالی باشد)."""
     host = ""
     with contextlib.suppress(Exception):
         from urllib.parse import urlparse
@@ -1269,22 +1270,19 @@ def link_label(url: str) -> str:
 
 def build_caption(title: str, description: str, url: str, size: int,
                   meta: dict, extra: str = "") -> str:
-    """کپشنِ فیلم: توضیحات (یا اسم فیلم) + لینکِ آبیِ کلیک‌شدنی. چیز دیگری نه."""
-    body = (description or "").strip() or (title or "").strip()
-    label = link_label(url)
-    anchor = '<a href="%s">%s</a>' % (html.escape(url, quote=True), html.escape(label))
-    text_anchor = '🔗 ' + anchor
-    parts = []
-    if body:
-        parts.append(html.escape(body))
-    if extra:                     # فقط وقتی لازم است (مثلاً فایل داکیومنت شد)
-        parts.append(html.escape(extra))
-    parts.append(text_anchor)
-    cap = "\n\n".join(parts)
-    if len(cap) > 1024:           # سقف کپشن تلگرام
-        keep = 1024 - len(text_anchor) - 8
-        cap = html.escape(body)[:max(0, keep)] + "…\n\n" + text_anchor
-    return cap
+    """کپشنِ فیلم: کلِ متن **خودش** لینک است (مثل Create link روی تمام متن).
+
+    همان کاری که خودت در تلگرام می‌کنی — کل کپشن را انتخاب و لینک می‌کنی —
+    ربات همان را می‌سازد: <a href="آدرس">متنِ کپشن</a>، بدون خطِ جدای لینک.
+    """
+    text = (description or "").strip() or (title or "").strip() or link_label(url)
+    href = html.escape(url, quote=True)
+    prefix = html.escape(extra) + "\n\n" if extra else ""
+    room = 1024 - len(prefix) - len(href) - 20
+    esc = html.escape(text)
+    if len(esc) > room:
+        esc = esc[:max(1, room)].rstrip() + "…"
+    return '%s<a href="%s">%s</a>' % (prefix, href, esc)
 
 
 def menu_text(p: Probe) -> str:
@@ -1780,8 +1778,17 @@ class Bot:
                             thumb_path = await make_thumb(
                                 frames[idx], folder, st,
                                 int(meta.get("width") or 0), int(meta.get("height") or 0))
-                            lg.add("thumb", "تامبنیل از عکس %d ساخته شد (%s)" % (
-                                idx + 1, human(thumb_path.stat().st_size) if thumb_path else "ناموفق"))
+                            if thumb_path:
+                                fw, fh = await probe_frame_size(frames[idx])
+                                lg.add("thumb", "تامبنیل از عکس %d: عکس %dx%d → تامبنیل %dx%d "
+                                      "(هم‌نسبتِ ویدیو %sx%s) · %s" % (
+                                          idx + 1, fw, fh, *thumb_dims(
+                                              int(meta.get("width") or 0) or fw,
+                                              int(meta.get("height") or 0) or fh),
+                                          meta.get("width"), meta.get("height"),
+                                          human(thumb_path.stat().st_size)))
+                            else:
+                                lg.add("thumb", "ساخت تامبنیل ناموفق بود")
                         else:
                             lg.add("thumb", "بدون تامبنیل (به‌خواست کاربر)")
                     else:
