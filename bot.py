@@ -42,7 +42,7 @@ from typing import Optional
 import aiohttp
 
 START_TS = time.time()
-VERSION = "2.6"
+VERSION = "2.7"
 
 
 def _env(name: str, default: str = "") -> str:
@@ -427,6 +427,12 @@ class ProgressFile(io.RawIOBase):
         super().close()
 
 
+def retry_after_of(text: str, default: float = 5.0) -> float:
+    """مقدار «retry after N» را از پیام خطای تلگرام بیرون می‌کشد."""
+    m = re.search(r"retry after[^0-9]*(\d+)", text or "", re.I)
+    return float(m.group(1)) if m else default
+
+
 class Telegram:
     def __init__(self, token: str, base: str):
         self.token = token
@@ -437,7 +443,25 @@ class Telegram:
     async def start(self):
         self.session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=None, connect=30, sock_read=120))
-        self.me = await self.call("getMe") or {}
+        # getMe را با تحملِ محدودیتِ تلگرام (خطای 429) می‌گیریم و هیچ‌وقت به‌خاطرش کرش نمی‌کنیم.
+        waited = 0.0
+        while True:
+            try:
+                self.me = await self.call("getMe") or {}
+                break
+            except Exception as e:
+                msg = str(e)
+                if "Too Many Requests" in msg or "429" in msg:
+                    wait = min(max(retry_after_of(msg), 2.0), 120.0)
+                    waited += wait
+                    print("[start] ⏳ تلگرام محدودیت گذاشته (%s) — %d ثانیه صبر می‌کنم "
+                          "(مجموع: %d ثانیه)" % (msg, int(wait), int(waited)), flush=True)
+                    await asyncio.sleep(wait)
+                    continue
+                print("[start] ⚠️ getMe نگرفت: %s — ۵ ثانیه بعد دوباره" % msg, flush=True)
+                await asyncio.sleep(5)
+        if waited:
+            print("[start] ✅ بعد از %d ثانیه انتظار، اتصال برقرار شد." % int(waited), flush=True)
         with contextlib.suppress(Exception):
             await self.call("deleteWebhook", {"drop_pending_updates": False})
 
@@ -461,8 +485,11 @@ class Telegram:
                         return body.get("result")
                     desc = str(body.get("description") or body)
                     if r.status == 429 and attempt < 2:
-                        wait = int((body.get("parameters") or {}).get("retry_after", 3))
-                        await asyncio.sleep(min(wait, 20))
+                        wait = int((body.get("parameters") or {}).get("retry_after", 0)
+                                   or retry_after_of(desc, 3))
+                        wait = min(max(wait, 2), 120)
+                        print("[api] ⏳ 429 روی %s — %d ثانیه صبر" % (method, wait), flush=True)
+                        await asyncio.sleep(wait)
                         continue
                     raise RuntimeError(desc)
             except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as e:
@@ -946,6 +973,12 @@ class Bot:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
+                msg = str(e)
+                if "Too Many Requests" in msg or "429" in msg:
+                    wait = min(max(retry_after_of(msg), 3.0), 120.0)
+                    print("[poll] ⏳ محدودیت تلگرام (%s) — %d ثانیه صبر" % (msg, int(wait)), flush=True)
+                    await asyncio.sleep(wait)
+                    continue
                 print("[poll] %s" % e, flush=True)
                 await asyncio.sleep(3)
 
@@ -1408,7 +1441,10 @@ async def main() -> int:
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     tg = Telegram(BOT_TOKEN, API_BASE)
     await tg.start()
-    print("✅ ربات @%s آماده است  (نسخه %s)" % ((tg.me or {}).get("username") or "?", VERSION), flush=True)
+    _uname = (tg.me or {}).get("username")
+    print(("✅ ربات @%s آماده است  (نسخه %s)" if _uname else
+           "⚠️ ربات بدون getMe بالا آمد (نسخه %s) — ولی پیام‌ها را می‌خواند") %
+          ((_uname, VERSION) if _uname else (VERSION,)), flush=True)
     cap_txt = ("%dMB" % MAX_UPLOAD_MB) if MAX_UPLOAD_MB < 1024 else ("%dMB ≈ %.2fGB" % (
         MAX_UPLOAD_MB, MAX_UPLOAD_MB / 1024))
     print("   سرور API: %s → سقف ارسال %s" % (API_BASE, cap_txt), flush=True)
