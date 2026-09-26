@@ -36,13 +36,14 @@ import shutil
 import signal
 import sys
 import time
+from urllib.parse import urljoin
 from pathlib import Path
 from typing import Optional
 
 import aiohttp
 
 START_TS = time.time()
-VERSION = "2.7"
+VERSION = "2.8"
 
 
 def _env(name: str, default: str = "") -> str:
@@ -582,12 +583,13 @@ class Telegram:
 
 
 class Option:
-    __slots__ = ("key", "label", "selector", "est", "audio", "direct")
+    __slots__ = ("key", "label", "selector", "est", "audio", "direct", "url")
 
     def __init__(self, key: str, label: str, selector: str, est: int = 0,
-                 audio: bool = False, direct: bool = False):
+                 audio: bool = False, direct: bool = False, url: str = ""):
         self.key, self.label, self.selector = key, label, selector
         self.est, self.audio, self.direct = est, audio, direct
+        self.url = url
 
 
 class Probe:
@@ -608,40 +610,72 @@ def _fmt_size(f: dict) -> int:
     return 0
 
 
+def _codec_roles(f: dict) -> str:
+    """نقشِ فرمت: muxed / video / audio / unknown / none.
+
+    بعضی سایت‌ها اصلاً اطلاعات کدک نمی‌دهند یا ارتفاع نمی‌دهند؛ این تابع
+    آن‌ها را «نامعلوم» می‌بیند تا از دست نروند (باگِ قبلی: نادیده گرفته می‌شدند).
+    """
+    v_raw, a_raw = f.get("vcodec"), f.get("acodec")
+    has_v = v_raw is not None and str(v_raw).lower() not in ("", "none")
+    has_a = a_raw is not None and str(a_raw).lower() not in ("", "none")
+    if has_v and has_a:
+        return "muxed"
+    if has_v:
+        return "video"
+    if has_a:
+        return "audio"
+    if v_raw is None and a_raw is None:
+        return "unknown"          # هیچ اطلاعی از کدک نیست (اغلب فایل کامل)
+    return "none"                 # صریحاً هیچ‌کدام
+
+
 def _options_from_info(info: dict, url: str) -> Probe:
     formats = [f for f in (info.get("formats") or []) if isinstance(f, dict)]
+    if info.get("url"):
+        formats.append(info)      # بعضی سایت‌ها فقط یک فرمتِ سرِ info می‌دهند
     by_h: dict[int, dict] = {}
     audio_best = 0
     muxed: dict[int, int] = {}
+    video_any = 0                 # بزرگ‌ترین حجمِ هر چیزِ ویدیویی (حتی بی‌ارتفاع)
+    has_video = False
     for f in formats:
-        vc = (f.get("vcodec") or "none").lower()
-        ac = (f.get("acodec") or "none").lower()
+        role = _codec_roles(f)
         h = int(f.get("height") or 0)
         size = _fmt_size(f)
-        if vc != "none" and ac != "none" and h:
-            muxed[h] = max(muxed.get(h, 0), size)          # فایل آماده (ویدیو+صدا)
-        if vc != "none" and ac == "none" and h:
-            cur = by_h.get(h) or {"v": 0}
-            if size > cur.get("v", 0):
-                cur["v"] = size
-            by_h[h] = cur
-        if vc == "none" and ac != "none":
+        if role == "muxed":
+            has_video = True
+            if h:
+                muxed[h] = max(muxed.get(h, 0), size)
+            video_any = max(video_any, size)
+        elif role == "video":
+            has_video = True
+            if h:
+                cur = by_h.get(h) or {"v": 0}
+                cur["v"] = max(cur.get("v", 0), size)
+                by_h[h] = cur
+            video_any = max(video_any, size)
+        elif role == "unknown":     # بدون اطلاعات کدک ⇒ کاندیدِ فایل کامل
+            has_video = True
+            if h:
+                muxed[h] = max(muxed.get(h, 0), size)
+            video_any = max(video_any, size)
+        elif role == "audio":
             audio_best = max(audio_best, size)
 
-    heights = sorted(by_h.keys(), reverse=True) or sorted(muxed.keys(), reverse=True)
+    heights = sorted(set(by_h) | set(muxed), reverse=True)
     heights = [h for h in heights if h >= 144][:MAX_OPTIONS]
     options: list[Option] = []
     for h in heights:
         if h in muxed and (h not in by_h or muxed[h] >= by_h[h].get("v", 0)):
             est = muxed[h]
-            sel = "bv*[height<=%d]+ba/b[height<=%d]/b" % (h, h)
         else:
             est = by_h.get(h, {}).get("v", 0) + audio_best
-            sel = "bv*[height<=%d]+ba/b[height<=%d]/b" % (h, h)
-        options.append(Option("h%d" % h, "%dp" % h, sel, est))
-    if not options and muxed:
-        h = max(muxed)
-        options.append(Option("h%d" % h, "%dp" % h, "b", muxed[h]))
+        options.append(Option("h%d" % h, "%dp" % h,
+                              "bv*[height<=%d]+ba/b[height<=%d]/b" % (h, h), est))
+    # راهِ نجات: ویدیو هست ولی کیفیت‌ها ارتفاع ندارند ⇒ «بهترین کیفیت» را بگذار
+    if not options and has_video:
+        options.append(Option("best", "🎥 بهترین کیفیت موجود", "b", video_any))
     dur = int(info.get("duration") or 0)
     if dur or audio_best or formats:
         options.append(Option("audio", "فقط صدا (mp3)", "ba/b", audio_best, audio=True))
@@ -652,35 +686,102 @@ def _options_from_info(info: dict, url: str) -> Probe:
                  direct=False, thumb=thumb)
 
 
-async def probe_url(url: str) -> tuple[Optional[Probe], str]:
-    """بررسی لینک: با yt-dlp اطلاعات می‌گیریم؛ اگر نشد، لینک مستقیم را امتحان می‌کنیم."""
-    if DOWNLOADER in ("auto", "ytdlp"):
-        st: dict = {}
-        cmd = [sys.executable, "-m", "yt_dlp", "-J", "--no-playlist", "--no-warnings",
-               "--socket-timeout", "25", "--user-agent", UA]
-        if COOKIES_FILE and Path(COOKIES_FILE).exists():
-            cmd += ["--cookies", COOKIES_FILE]
-        cmd += ["--", url]
-        try:
-            code, out = await run_proc(cmd, st)
-            if code == 0:
-                # آخرین خطِ JSON (بعضی سایت‌ها هشدار هم چاپ می‌کنند)
-                js = None
-                for line in reversed(out.splitlines()):
-                    line = line.strip()
-                    if line.startswith("{"):
-                        with contextlib.suppress(Exception):
-                            js = json.loads(line)
-                        if js:
-                            break
-                if js and (js.get("formats") or js.get("url")):
-                    p = _options_from_info(js, url)
-                    if p.options:
-                        return p, ""
-        except Exception:
-            pass
+# ─────────────────── پیدا کردن ویدیوی داخل صفحهٔ سایت ───────────────────
 
-    # فال‌بک: لینک مستقیم
+_hesc = html.unescape
+
+REL_VID_RE = re.compile(
+    r"""[\s("'=]([^\s"'<>\\]{1,400}?\.(?:mp4|m3u8|webm|mkv|mov)(?:\?[^\s"'<>\\]*)?)""",
+    re.I)
+
+VID_URL_RE = re.compile(
+    r"""(?:"|'|=|\()((?:https?:)?//[^"'\s<>\\]+?\.(?:mp4|m3u8|webm|mkv|mov)(?:\?[^"'\s<>\\]*)?)""",
+    re.I)
+
+
+def _page_candidates(doc: str, base: str) -> list[str]:
+    """آدرس‌های ویدیوییِ داخل HTML صفحه (og:video، تگ video/source و لینک‌های .mp4)."""
+    out: list[str] = []
+    for m in re.finditer(r"<meta[^>]+>", doc, re.I):
+        tag = m.group(0)
+        if "og:video" not in tag.lower():
+            continue
+        c = re.search(r"""content\s*=\s*["']([^"']+)["']""", tag, re.I)
+        if c:
+            out.append(c.group(1).strip())
+    for m in re.finditer(r"<(?:video|source|embed)[^>]+>", doc, re.I):
+        tag = m.group(0)
+        c = re.search(r"""src\s*=\s*["']([^"']+)["']""", tag, re.I)
+        if c:
+            out.append(c.group(1).strip())
+    out += [m.group(1) for m in VID_URL_RE.finditer(doc)]
+    out += [m.group(1) for m in REL_VID_RE.finditer(doc)]
+    seen, clean = set(), []
+    for u in out:
+        u = _hesc(u).strip().strip('"\'')
+        if not u or u.lower().startswith(("data:", "blob:", "javascript:")):
+            continue
+        if u.startswith("//"):
+            u = "https:" + u
+        u = urljoin(base, u)
+        if not u.lower().startswith(("http://", "https://")):
+            continue
+        if u.lower().split("?")[0].endswith(".ts"):     # قطعه‌های m3u8 را دور بریز
+            continue
+        if u not in seen:
+            seen.add(u)
+            clean.append(u)
+    return clean[:8]
+
+
+async def page_video_scan(url: str) -> tuple[list[Option], str]:
+    """صفحه را می‌خواند و آدرس‌های ویدیوییِ داخلش را با حجم برمی‌گرداند."""
+    if not url.lower().startswith(("http://", "https://")):
+        return [], ""
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as sess:
+            async with sess.get(url, headers={"User-Agent": UA, "Accept": "*/*"},
+                                allow_redirects=True) as r:
+                if r.status >= 400:
+                    return [], ""
+                ctype = (r.headers.get("Content-Type") or "").lower()
+                if not any(t in ctype for t in ("html", "text", "xml", "json")):
+                    return [], ""
+                raw = await r.content.read(3 * 1024 * 1024)
+                doc = raw.decode(r.charset or "utf-8", "replace")
+    except Exception:
+        return [], ""
+    title = ""
+    tm = re.search(r"<title[^>]*>(.*?)</title>", doc, re.I | re.S)
+    if tm:
+        title = cut(_hesc(tm.group(1)).strip(), 80)
+    cands = _page_candidates(doc, url)
+    if not cands:
+        return [], title
+    opts: list[Option] = []
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as sess:
+        for i, u in enumerate(cands):
+            size, ok = 0, True
+            with contextlib.suppress(Exception):
+                async with sess.head(u, headers={"User-Agent": UA},
+                                     allow_redirects=True) as hr:
+                    size = int(hr.headers.get("Content-Length") or 0)
+                    ct = (hr.headers.get("Content-Type") or "").lower()
+                    if hr.status >= 400 or (ct and not ct.startswith(
+                            ("video/", "audio/", "application/octet-stream",
+                             "application/vnd.apple.mpegurl", "application/x-mpegurl"))):
+                        ok = False
+            if not ok:
+                continue
+            name = os.path.basename(u.split("?")[0].rstrip("/")) or ("video%d" % (i + 1))
+            opts.append(Option("src%d" % i, "🎥 %s" % cut(name, 34), "", size,
+                               direct=True, url=u))
+    opts.sort(key=lambda o: o.est, reverse=True)
+    return opts[:max(1, MAX_OPTIONS - 1)], title
+
+
+async def _direct_probe(url: str) -> Optional[Probe]:
+    """لینک مستقیمِ فایل (mp4/…): با HEAD حجم و نام را می‌گیریم."""
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25)) as s:
             async with s.head(url, allow_redirects=True, headers={"User-Agent": UA}) as r:
@@ -691,11 +792,66 @@ async def probe_url(url: str) -> tuple[Optional[Probe], str]:
                         or "attachment" in disp.lower() or url.split("?")[0].lower().endswith(
                             tuple(VIDEO_EXT | AUDIO_EXT | FILE_EXT))):
                     name = os.path.basename(url.split("?")[0].rstrip("/")) or "file"
-                    opt = Option("direct", "%s" % cut(name, 40), "", size, direct=True)
-                    return Probe(url, name, "", 0, [opt], direct=True), ""
-                return None, "unsupported"
+                    opt = Option("direct", "%s" % cut(name, 40), "", size, direct=True, url=url)
+                    return Probe(url, name, "", 0, [opt], direct=True)
     except Exception:
-        return None, "unsupported"
+        return None
+    return None
+
+
+async def probe_url(url: str) -> tuple[Optional[Probe], str]:
+    """بررسی لینک: yt-dlp → لینک مستقیم → ویدیوی داخل صفحهٔ سایت."""
+    p: Optional[Probe] = None
+    if DOWNLOADER in ("auto", "ytdlp"):
+        st: dict = {}
+        cmd = [sys.executable, "-m", "yt_dlp", "-J", "--no-playlist", "--no-warnings",
+               "--socket-timeout", "25", "--user-agent", UA]
+        if COOKIES_FILE and Path(COOKIES_FILE).exists():
+            cmd += ["--cookies", COOKIES_FILE]
+        cmd += ["--", url]
+        try:
+            code, out = await run_proc(cmd, st)
+            if code == 0:
+                js = None
+                for line in reversed(out.splitlines()):
+                    line = line.strip()
+                    if line.startswith("{"):
+                        with contextlib.suppress(Exception):
+                            js = json.loads(line)
+                        if js:
+                            break
+                if js and (js.get("formats") or js.get("url")):
+                    cand = _options_from_info(js, url)
+                    if cand.options:
+                        p = cand
+        except Exception:
+            pass
+
+    has_video = bool(p and any(not o.audio for o in p.options))
+    if has_video:
+        return p, ""
+
+    # لینک مستقیم؟
+    d = await _direct_probe(url)
+    if d:
+        return d, ""
+
+    # ویدیوی داخل صفحهٔ سایت (فال‌بک مهم برای سایت‌های فیلم)
+    opts, page_title = await page_video_scan(url)
+    if opts:
+        keep_audio = [o for o in (p.options if p else []) if o.audio]
+        probe = Probe((p.url if p else url),
+                      (p.title if p and p.title else (page_title or "ویدیو")),
+                      (p.description if p else ""),
+                      (p.duration if p else 0),
+                      opts + keep_audio, direct=True,
+                      thumb=(p.thumb if p else ""))
+        print("[probe] 🎥 %d ویدیو داخل صفحه پیدا شد" % len(opts), flush=True)
+        return probe, ""
+
+    if p and p.options:
+        return p, ""            # مثلاً فقط صدا — همان قبلی
+    return None, "unsupported"
 
 
 # ─────────────────────────── دانلود ───────────────────────────
@@ -914,6 +1070,10 @@ def menu_text(p: Probe) -> str:
     for i, o in enumerate(p.options, 1):
         sz = human(o.est) if o.est else "حجم نامعلوم"
         lines.append("%d. %s — %s" % (i, o.label, sz))
+    if not any(not o.audio for o in p.options):
+        lines.append("")
+        lines.append("⚠️ از این لینک ویدیویی پیدا نشد (فقط صدا). اگر باید ویدیو داشته "
+                     "باشد، /log را بزن تا ببینم مشکل کجاست.")
     return "\n".join(lines)
 
 
@@ -1226,7 +1386,7 @@ class Bot:
                                        progress_text("download", 0, 0, option.est or 0,
                                                      "", "", st.get("note", "")))
                 if option.direct or DOWNLOADER == "aria2":
-                    path, err = await download_aria2(probe.url, folder, st)
+                    path, err = await download_aria2(option.url or probe.url, folder, st)
                     if not path:
                         path, err = await download_ytdlp(probe.url, option, folder, st)
                 else:
